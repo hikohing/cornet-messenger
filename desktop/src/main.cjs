@@ -1,11 +1,12 @@
 'use strict'
 
-const { app, BrowserWindow, shell, Menu } = require('electron')
+const { app, BrowserWindow, shell, Menu, dialog } = require('electron')
 const path = require('node:path')
 const { MirrorStore, pickWorkingMirror, checkMirrorHealth, refreshRemoteMirrors } = require('./mirrors.js')
 
 const MIRROR_HEALTH_INTERVAL_MS = 30_000
 const REMOTE_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000
 
 const isDev = !app.isPackaged
 const resourcesDir = isDev ? path.join(__dirname, '..', 'resources') : process.resourcesPath
@@ -92,6 +93,42 @@ function startMirrorMonitoring() {
   setInterval(() => void refreshRemoteMirrors(store), REMOTE_REFRESH_INTERVAL_MS)
 }
 
+/**
+ * Reads the new build straight from GitHub Releases (see electron-builder.yml's
+ * `publish` block) — a public repo, so no token is baked into the shipped binary.
+ * Failure here (offline, no releases yet, DPI blocking github.com) is silent and
+ * never blocks the app: this is a nice-to-have, not a dependency for the app to work.
+ */
+function startAutoUpdate() {
+  if (isDev) return
+  let autoUpdater
+  try {
+    ;({ autoUpdater } = require('electron-updater'))
+  } catch (err) {
+    console.error('electron-updater недоступен:', err)
+    return
+  }
+  autoUpdater.autoDownload = true
+  autoUpdater.on('error', (err) => console.error('Ошибка автообновления:', err))
+  autoUpdater.on('update-downloaded', (info) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    dialog
+      .showMessageBox(mainWindow, {
+        type: 'info',
+        buttons: ['Перезапустить сейчас', 'Позже'],
+        defaultId: 0,
+        title: 'Доступно обновление',
+        message: `Загружена версия ${info.version}. Перезапустить приложение сейчас, чтобы применить обновление?`,
+      })
+      .then(({ response }) => {
+        if (response === 0) autoUpdater.quitAndInstall()
+      })
+  })
+  const check = () => void autoUpdater.checkForUpdates().catch((err) => console.error('Проверка обновлений не удалась:', err))
+  check()
+  setInterval(check, UPDATE_CHECK_INTERVAL_MS)
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -119,6 +156,7 @@ app.whenReady().then(async () => {
   createWindow()
   await connectToBestMirror()
   startMirrorMonitoring()
+  startAutoUpdate()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

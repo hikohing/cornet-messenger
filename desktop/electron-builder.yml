@@ -18,3 +18,7 @@ nsis:
   oneClick: false
   perMachine: true
   allowToChangeInstallationDirectory: true
+publish:
+  provider: github
+  owner: hikohing
+  repo: cornet-messenger
