@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws'
-import { userFromToken, touchLastSeen } from './auth.js'
+import { userFromToken, touchLastSeen, touchSessionSeen, sessionTokenHash } from './auth.js'
 import { audit } from './audit.js'
 import { createTokenBucket } from './rateLimiter.js'
 import {
@@ -79,6 +79,18 @@ export function disconnectSession(token) {
   for (const sockets of connections.values()) {
     for (const ws of sockets) {
       if (ws.authToken === token) ws.close(4001, 'Session ended')
+    }
+  }
+}
+
+/** Same as disconnectSession, but by the hashed session id — used when revoking a
+ *  session we only know the hash of (e.g. from the "manage sessions" list, where the
+ *  raw bearer token was never exposed to the viewer in the first place). */
+export function disconnectSessionByHash(hash) {
+  if (!hash) return
+  for (const sockets of connections.values()) {
+    for (const ws of sockets) {
+      if (ws.sessionHash === hash) ws.close(4001, 'Session ended')
     }
   }
 }
@@ -177,6 +189,8 @@ export function attachWebSocket(httpServer) {
 
     ws.isAlive = true
     ws.authToken = token
+    ws.sessionHash = sessionTokenHash(token)
+    void touchSessionSeen(token)
     // Общий лимит на все события WS плюс отдельный, более строгий — на сами
     // сообщения чата (самая тяжёлая и заметная жертвам операция: запись в БД + рассылка).
     const generalLimiter = createTokenBucket({ capacity: 30, refillPerSec: 6 })

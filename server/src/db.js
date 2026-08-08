@@ -70,6 +70,9 @@ export async function initSchema() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (LOWER(email)) WHERE email IS NOT NULL;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS status_text TEXT NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false;
 
     CREATE TABLE IF NOT EXISTS email_verifications (
       token_hash TEXT PRIMARY KEY,
@@ -100,8 +103,27 @@ export async function initSchema() {
       created_at BIGINT NOT NULL
     );
 
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen_at BIGINT;
+
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
+
+    CREATE TABLE IF NOT EXISTS totp_backup_codes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      code_hash TEXT NOT NULL,
+      used BOOLEAN NOT NULL DEFAULT false,
+      created_at BIGINT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_totp_backup_codes_user ON totp_backup_codes(user_id);
+
+    CREATE TABLE IF NOT EXISTS pending_logins (
+      token_hash TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at BIGINT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS chats (
       id SERIAL PRIMARY KEY,

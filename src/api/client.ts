@@ -50,9 +50,34 @@ export function register(username: string, password: string) {
 }
 
 export function login(username: string, password: string) {
-  return request<{ user: User }>('/api/auth/login', {
+  return request<{ user: User } | { twoFactorRequired: true; pendingToken: string }>('/api/auth/login', {
     method: 'POST',
     body: JSON.stringify({ username, password }),
+  })
+}
+
+export function verifyTwoFactorLogin(pendingToken: string, code: string) {
+  return request<{ user: User }>('/api/auth/2fa/verify', {
+    method: 'POST',
+    body: JSON.stringify({ pendingToken, code }),
+  })
+}
+
+export function enrollTotp() {
+  return request<{ secret: string; otpauthUrl: string }>('/api/me/2fa/enroll', { method: 'POST' })
+}
+
+export function confirmTotp(code: string) {
+  return request<{ backupCodes: string[] }>('/api/me/2fa/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  })
+}
+
+export function disableTotp(password: string) {
+  return request<{ ok: true }>('/api/me/2fa/disable', {
+    method: 'POST',
+    body: JSON.stringify({ password }),
   })
 }
 
@@ -106,6 +131,7 @@ export function updateProfile(patch: {
   profileSecondaryColor?: string | null
   showLastSeen?: boolean
   bio?: string
+  statusText?: string
   birthDate?: string | null
   displayName?: string | null
 }) {
@@ -131,6 +157,26 @@ export function changePassword(oldPassword: string, newPassword: string) {
     method: 'POST',
     body: JSON.stringify({ oldPassword, newPassword }),
   })
+}
+
+export interface SessionInfo {
+  id: string
+  userAgent: string | null
+  createdAt: number
+  lastSeenAt: number
+  isCurrent: boolean
+}
+
+export function getSessions() {
+  return request<{ sessions: SessionInfo[] }>('/api/me/sessions')
+}
+
+export function revokeSession(sessionId: string) {
+  return request<{ ok: boolean }>(`/api/me/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+}
+
+export function revokeOtherSessions() {
+  return request<{ ok: true; count: number }>('/api/me/sessions', { method: 'DELETE' })
 }
 
 export function requestEmailVerification(email: string) {

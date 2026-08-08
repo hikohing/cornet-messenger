@@ -4677,6 +4677,39 @@
   color: var(--success);
 }
 
+.settings-live-inline-status {
+  width: 100%;
+  margin-top: 6px;
+  margin-left: -6px;
+  padding: 3px 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--pcard-muted);
+  font: inherit;
+  font-size: 0.8rem;
+  transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+
+.settings-live-inline-status:hover {
+  background: rgba(127, 143, 158, 0.12);
+}
+
+.settings-live-inline-status:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: rgba(127, 143, 158, 0.14);
+}
+
+.profile-card__status {
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--pcard-muted);
+  font-size: 0.8rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Палитры плашек — общие для карточки и для тайла выбора в настройках. */
 .profile-nameplate--cosmic,
 .profile-nameplate-option--cosmic > span {
@@ -6251,6 +6284,72 @@
 
 .settings-card--rows {
   gap: 0;
+}
+
+.settings-share-profile__body {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-top: var(--space-3);
+}
+
+.settings-share-profile__qr {
+  flex-shrink: 0;
+  border-radius: var(--radius-md);
+  background: #fff;
+  padding: 6px;
+}
+
+.settings-share-profile__link-row {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.settings-share-profile__link-row .text-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-2fa-enroll {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.settings-2fa-enroll img {
+  border-radius: var(--radius-md);
+  background: #fff;
+  padding: 6px;
+}
+
+.settings-2fa-enroll code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Consolas, monospace;
+  word-break: break-all;
+}
+
+.settings-2fa-enroll__actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.settings-2fa-backup-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.settings-2fa-backup-codes code {
+  text-align: center;
+  padding: 8px;
+  font-size: 0.9rem;
 }
 
 /* Плитка-подсказка остаётся выделенной карточкой. */

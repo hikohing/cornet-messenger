@@ -20,6 +20,13 @@ import {
   removeEmail,
   requestPasswordReset,
   resetPasswordWithToken,
+  listSessions,
+  revokeSession,
+  revokeOtherSessions,
+  verifyTwoFactorLogin,
+  enrollTotp,
+  confirmTotp,
+  disableTotp,
 } from './auth.js'
 import {
   getOrCreateDirectChat,
@@ -34,7 +41,7 @@ import {
   leaveGroup,
   chatIdsForUser,
 } from './chats.js'
-import { attachWebSocket, isOnline, notifyChatCreated, notifyChatUpdated, notifyChatLeft, disconnectSession, disconnectUser } from './ws.js'
+import { attachWebSocket, isOnline, notifyChatCreated, notifyChatUpdated, notifyChatLeft, disconnectSession, disconnectSessionByHash, disconnectUser } from './ws.js'
 import { appError, publicErrorMessage } from './errors.js'
 import { buildIceServers } from './ice.js'
 import { audit } from './audit.js'
@@ -98,6 +105,15 @@ const upload = multer({
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { error: 'Слишком много попыток. Попробуйте позже.' },
+})
+
+const twoFactorLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 8,
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
@@ -275,7 +291,7 @@ app.post(
   registerLimiter,
   asyncRoute(async (req, res) => {
     const { username, password } = req.body
-    const session = await register(username ?? '', password ?? '')
+    const session = await register(username ?? '', password ?? '', req.headers['user-agent'])
     req.auditUser = session.user
     setSessionCookie(req, res, session.token)
     res.status(201).json({ user: session.user })
@@ -287,7 +303,23 @@ app.post(
   loginLimiter,
   asyncRoute(async (req, res) => {
     const { username, password } = req.body
-    const session = await login(username ?? '', password ?? '')
+    const session = await login(username ?? '', password ?? '', req.headers['user-agent'])
+    if (session.twoFactorRequired) {
+      res.json({ twoFactorRequired: true, pendingToken: session.pendingToken })
+      return
+    }
+    req.auditUser = session.user
+    setSessionCookie(req, res, session.token)
+    res.json({ user: session.user })
+  }),
+)
+
+app.post(
+  '/api/auth/2fa/verify',
+  twoFactorLimiter,
+  asyncRoute(async (req, res) => {
+    const { pendingToken, code } = req.body ?? {}
+    const session = await verifyTwoFactorLogin(pendingToken ?? '', code ?? '', req.headers['user-agent'])
     req.auditUser = session.user
     setSessionCookie(req, res, session.token)
     res.json({ user: session.user })
@@ -328,9 +360,71 @@ app.post(
   sensitiveActionLimiter,
   asyncRoute(async (req, res) => {
     const { oldPassword, newPassword } = req.body ?? {}
-    const session = await changePassword(req.user.id, oldPassword ?? '', newPassword ?? '')
+    const session = await changePassword(req.user.id, oldPassword ?? '', newPassword ?? '', req.headers['user-agent'])
     disconnectUser(req.user.id)
     setSessionCookie(req, res, session.token)
+    res.json({ ok: true })
+  }),
+)
+
+app.get(
+  '/api/me/sessions',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    res.json({ sessions: await listSessions(req.user.id, req.authToken) })
+  }),
+)
+
+app.delete(
+  '/api/me/sessions/:id',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    const sessionId = req.params.id
+    const revoked = await revokeSession(req.user.id, sessionId)
+    if (revoked) disconnectSessionByHash(sessionId)
+    res.json({ ok: revoked })
+  }),
+)
+
+app.delete(
+  '/api/me/sessions',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    const revokedHashes = await revokeOtherSessions(req.user.id, req.authToken)
+    for (const hash of revokedHashes) disconnectSessionByHash(hash)
+    res.json({ ok: true, count: revokedHashes.length })
+  }),
+)
+
+app.post(
+  '/api/me/2fa/enroll',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    res.json(await enrollTotp(req.user.id))
+  }),
+)
+
+app.post(
+  '/api/me/2fa/confirm',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    const result = await confirmTotp(req.user.id, req.body?.code ?? '')
+    await Promise.all((await chatIdsForUser(req.user.id)).map((chatId) => notifyChatUpdated(chatId)))
+    res.json(result)
+  }),
+)
+
+app.post(
+  '/api/me/2fa/disable',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    await disableTotp(req.user.id, req.body?.password ?? '')
+    await Promise.all((await chatIdsForUser(req.user.id)).map((chatId) => notifyChatUpdated(chatId)))
     res.json({ ok: true })
   }),
 )
@@ -376,7 +470,7 @@ app.post(
   '/api/auth/reset-password',
   sensitiveActionLimiter,
   asyncRoute(async (req, res) => {
-    const session = await resetPasswordWithToken(req.body?.token ?? '', req.body?.newPassword ?? '')
+    const session = await resetPasswordWithToken(req.body?.token ?? '', req.body?.newPassword ?? '', req.headers['user-agent'])
     setSessionCookie(req, res, session.token)
     res.json({ user: session.user })
   }),

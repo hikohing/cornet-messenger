@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { promisify } from 'node:util'
-import { one, run } from './db.js'
+import * as OTPAuth from 'otpauth'
+import { one, run, many } from './db.js'
 import { createSavedChat, isSafeAttachmentUrl } from './chats.js'
 import { appError } from './errors.js'
 import { sendPasswordResetEmail, sendVerificationEmail, sendSecurityAlert } from './mailer.js'
@@ -9,6 +10,57 @@ import { audit } from './audit.js'
 const APP_ORIGIN = process.env.APP_ORIGIN || `http://localhost:${process.env.PORT ?? 4000}`
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000
+const PENDING_LOGIN_TTL_MS = 5 * 60 * 1000
+const TOTP_ISSUER = 'CorNet'
+const BACKUP_CODE_COUNT = 10
+
+/**
+ * TOTP secrets are encrypted at rest (AES-256-GCM) so a database-only leak doesn't
+ * also hand over everyone's 2FA. The key must be supplied by the operator — there is
+ * deliberately no built-in fallback key, since a default key shared across every
+ * deployment would defeat the point of encrypting in the first place.
+ */
+function loadTotpEncKey() {
+  const raw = process.env.TOTP_ENC_KEY
+  if (!raw) return null
+  try {
+    const buf = Buffer.from(raw, raw.length === 64 ? 'hex' : 'base64')
+    if (buf.length !== 32) throw new Error('wrong length')
+    return buf
+  } catch {
+    console.error('TOTP_ENC_KEY задан, но не является корректным 32-байтным ключом (64 hex-символа или 44 base64-символа) — 2FA будет недоступна.')
+    return null
+  }
+}
+const TOTP_ENC_KEY = loadTotpEncKey()
+
+function encryptTotpSecret(plaintext) {
+  if (!TOTP_ENC_KEY) throw appError('2FA не настроена на сервере — обратитесь к администратору', 500)
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', TOTP_ENC_KEY, iv)
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
+  return `${iv.toString('hex')}:${cipher.getAuthTag().toString('hex')}:${encrypted.toString('hex')}`
+}
+
+function decryptTotpSecret(stored) {
+  if (!TOTP_ENC_KEY) throw appError('2FA не настроена на сервере — обратитесь к администратору', 500)
+  const [ivHex, tagHex, dataHex] = stored.split(':')
+  const decipher = crypto.createDecipheriv('aes-256-gcm', TOTP_ENC_KEY, Buffer.from(ivHex, 'hex'))
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'))
+  return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8')
+}
+
+function backupCodeHash(code) {
+  return crypto.createHash('sha256').update(code).digest('hex')
+}
+
+/** No 0/O/1/I — avoids codes that are ambiguous to read back from a saved list. */
+function generateBackupCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  let code = ''
+  for (let i = 0; i < 10; i++) code += chars[crypto.randomInt(chars.length)]
+  return `${code.slice(0, 5)}-${code.slice(5)}`
+}
 
 const PALETTE = ['#6c5ce7', '#00b894', '#0984e3', '#e17055', '#d63031', '#00cec9', '#e84393', '#fdcb6e']
 const scrypt = promisify(crypto.scrypt)
@@ -93,7 +145,7 @@ function validatePassword(password) {
   }
 }
 
-function sessionTokenHash(token) {
+export function sessionTokenHash(token) {
   return `v1:${crypto.createHash('sha256').update(token).digest('hex')}`
 }
 
@@ -115,6 +167,7 @@ function toPublicUser(row) {
     profilePrimaryColor: row.profile_primary_color,
     profileSecondaryColor: row.profile_secondary_color,
     showLastSeen: row.show_last_seen,
+    statusText: row.status_text ?? '',
     bio: row.bio ?? '',
     birthDate: row.birth_date,
     lastSeenAt: row.last_seen_at ? Number(row.last_seen_at) : null,
@@ -123,10 +176,11 @@ function toPublicUser(row) {
     // исключительно для приватного "я" (login/register/me), не для карточек в чатах.
     email: row.email ?? null,
     emailVerified: Boolean(row.email_verified),
+    totpEnabled: Boolean(row.totp_enabled),
   }
 }
 
-export async function register(username, password) {
+export async function register(username, password, userAgent) {
   username = typeof username === 'string' ? username.trim() : ''
   if (!/^[A-Za-z0-9_]{3,24}$/.test(username)) {
     throw appError('Username: 3–24 латинские буквы, цифры или знак подчёркивания')
@@ -142,10 +196,10 @@ export async function register(username, password) {
     [username, passwordHash, color, Date.now()],
   )
   await createSavedChat(row.id)
-  return createSession(row.id)
+  return createSession(row.id, userAgent)
 }
 
-export async function login(username, password) {
+export async function login(username, password, userAgent) {
   const normalizedUsername = typeof username === 'string' ? username.trim() : ''
   const safePassword = typeof password === 'string' ? password : ''
   const locked = normalizedUsername !== '' && isLockedOut(normalizedUsername)
@@ -161,14 +215,45 @@ export async function login(username, password) {
     throw appError('Неверное имя пользователя или пароль', 401, 'INVALID_CREDENTIALS')
   }
   clearLoginFailures(normalizedUsername)
-  return createSession(user.id)
+  if (user.totp_enabled) {
+    const pendingToken = crypto.randomBytes(32).toString('hex')
+    await run('DELETE FROM pending_logins WHERE created_at <= $1', [Date.now() - PENDING_LOGIN_TTL_MS])
+    await run('INSERT INTO pending_logins (token_hash, user_id, created_at) VALUES ($1, $2, $3)', [
+      sessionTokenHash(pendingToken),
+      user.id,
+      Date.now(),
+    ])
+    return { twoFactorRequired: true, pendingToken }
+  }
+  return createSession(user.id, userAgent)
 }
 
-async function createSession(userId) {
+/** Completes a login that was paused for 2FA — the second half of the two-step flow above. */
+export async function verifyTwoFactorLogin(pendingToken, code, userAgent) {
+  if (typeof pendingToken !== 'string' || !pendingToken) throw appError('Сессия входа истекла, попробуйте снова', 400)
+  const row = await one('SELECT * FROM pending_logins WHERE token_hash = $1 AND created_at > $2', [
+    sessionTokenHash(pendingToken),
+    Date.now() - PENDING_LOGIN_TTL_MS,
+  ])
+  if (!row) throw appError('Сессия входа истекла, попробуйте снова', 400, 'PENDING_LOGIN_EXPIRED')
+  const ok = await verifyTotpOrBackupCode(row.user_id, code)
+  if (!ok) throw appError('Неверный код', 401, 'INVALID_TOTP')
+  await run('DELETE FROM pending_logins WHERE token_hash = $1', [sessionTokenHash(pendingToken)])
+  return createSession(row.user_id, userAgent)
+}
+
+async function createSession(userId, userAgent) {
   const token = crypto.randomBytes(32).toString('hex')
   const now = Date.now()
+  const safeUserAgent = typeof userAgent === 'string' ? userAgent.slice(0, 300) : null
   await run('DELETE FROM sessions WHERE created_at <= $1', [now - SESSION_TTL_MS])
-  await run('INSERT INTO sessions (token, user_id, created_at) VALUES ($1, $2, $3)', [sessionTokenHash(token), userId, now])
+  await run('INSERT INTO sessions (token, user_id, created_at, user_agent, last_seen_at) VALUES ($1, $2, $3, $4, $5)', [
+    sessionTokenHash(token),
+    userId,
+    now,
+    safeUserAgent,
+    now,
+  ])
   await run(
     `DELETE FROM sessions WHERE token IN (
        SELECT token FROM sessions WHERE user_id = $1 ORDER BY created_at DESC OFFSET $2
@@ -190,9 +275,45 @@ export async function userFromToken(token) {
   return toPublicUser(row)
 }
 
+export async function touchSessionSeen(token) {
+  if (typeof token !== 'string' || !token) return
+  await run('UPDATE sessions SET last_seen_at = $1 WHERE token = $2', [Date.now(), sessionTokenHash(token)])
+}
+
 export async function deleteSession(token) {
   if (typeof token !== 'string' || !token) return
   await run('DELETE FROM sessions WHERE token IN ($1, $2)', [sessionTokenHash(token), token])
+}
+
+/** Session "id" exposed to the client is the hashed token — safe to show (one-way), never the bearer value. */
+export async function listSessions(userId, currentToken) {
+  const currentHash = typeof currentToken === 'string' ? sessionTokenHash(currentToken) : null
+  const rows = await many(
+    'SELECT token, user_agent, created_at, last_seen_at FROM sessions WHERE user_id = $1 ORDER BY COALESCE(last_seen_at, created_at) DESC',
+    [userId],
+  )
+  return rows.map((row) => ({
+    id: row.token,
+    userAgent: row.user_agent,
+    createdAt: Number(row.created_at),
+    lastSeenAt: row.last_seen_at ? Number(row.last_seen_at) : Number(row.created_at),
+    isCurrent: row.token === currentHash,
+  }))
+}
+
+/** Revokes one session by its hashed id — only if it belongs to userId. Returns true if a row was removed. */
+export async function revokeSession(userId, sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) return false
+  const result = await run('DELETE FROM sessions WHERE token = $1 AND user_id = $2', [sessionId, userId])
+  return result.rowCount > 0
+}
+
+/** Revokes every session for a user except the one currently making the request. */
+export async function revokeOtherSessions(userId, currentToken) {
+  const currentHash = typeof currentToken === 'string' ? sessionTokenHash(currentToken) : null
+  const rows = await many('SELECT token FROM sessions WHERE user_id = $1 AND token != $2', [userId, currentHash ?? '']);
+  await run('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, currentHash ?? ''])
+  return rows.map((row) => row.token)
 }
 
 export async function authMiddleware(req, res, next) {
@@ -206,9 +327,10 @@ export async function authMiddleware(req, res, next) {
   next()
 }
 
-export async function updateProfile(userId, { color, avatarUrl, bannerUrl, bannerStyle, avatarDecoration, profileEffect, profileTheme, nameStyle, profileFrame, nameplateStyle, profilePrimaryColor, profileSecondaryColor, showLastSeen, bio, birthDate, displayName, username }) {
+export async function updateProfile(userId, { color, avatarUrl, bannerUrl, bannerStyle, avatarDecoration, profileEffect, profileTheme, nameStyle, profileFrame, nameplateStyle, profilePrimaryColor, profileSecondaryColor, showLastSeen, bio, statusText, birthDate, displayName, username }) {
   const current = await one('SELECT * FROM users WHERE id = $1', [userId])
   if (bio !== undefined && bio.length > 200) throw appError('Описание не должно превышать 200 символов')
+  if (statusText !== undefined && statusText.length > 60) throw appError('Статус не должен превышать 60 символов')
   if (birthDate !== undefined && birthDate !== null && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) {
     throw appError('Некорректная дата рождения')
   }
@@ -253,7 +375,7 @@ export async function updateProfile(userId, { color, avatarUrl, bannerUrl, banne
     `UPDATE users SET color = $1, avatar_url = $2, show_last_seen = $3, bio = $4, birth_date = $5,
      display_name = $6, username = $7, banner_url = $8, banner_style = $9, avatar_decoration = $10,
      profile_effect = $11, profile_theme = $12, name_style = $13, profile_frame = $14,
-     nameplate_style = $15, profile_primary_color = $16, profile_secondary_color = $17 WHERE id = $18`,
+     nameplate_style = $15, profile_primary_color = $16, profile_secondary_color = $17, status_text = $18 WHERE id = $19`,
     [
       color ?? current.color,
       avatarUrl !== undefined ? avatarUrl : current.avatar_url,
@@ -272,13 +394,14 @@ export async function updateProfile(userId, { color, avatarUrl, bannerUrl, banne
       nameplateStyle !== undefined ? nameplateStyle : current.nameplate_style,
       profilePrimaryColor !== undefined ? profilePrimaryColor : current.profile_primary_color,
       profileSecondaryColor !== undefined ? profileSecondaryColor : current.profile_secondary_color,
+      statusText !== undefined ? statusText.trim() : current.status_text,
       userId,
     ],
   )
   return toPublicUser(await one('SELECT * FROM users WHERE id = $1', [userId]))
 }
 
-export async function changePassword(userId, oldPassword, newPassword) {
+export async function changePassword(userId, oldPassword, newPassword, userAgent) {
   const user = await one('SELECT * FROM users WHERE id = $1', [userId])
   validatePassword(newPassword)
   if (!(await verifyPassword(oldPassword, user.password_hash))) throw appError('Неверный текущий пароль', 401, 'INVALID_PASSWORD')
@@ -286,7 +409,7 @@ export async function changePassword(userId, oldPassword, newPassword) {
   await run('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(newPassword), userId])
   await run('DELETE FROM sessions WHERE user_id = $1', [userId])
   clearLoginFailures(user.username)
-  return createSession(userId)
+  return createSession(userId, userAgent)
 }
 
 export async function touchLastSeen(userId) {
@@ -360,7 +483,7 @@ export async function requestPasswordReset(email) {
 }
 
 /** Сбрасывает пароль по токену из письма, гасит все сессии и сразу выдаёт новую. */
-export async function resetPasswordWithToken(token, newPassword) {
+export async function resetPasswordWithToken(token, newPassword, userAgent) {
   if (typeof token !== 'string' || !token) throw appError('Ссылка недействительна')
   validatePassword(newPassword)
   const row = await one(
@@ -371,5 +494,63 @@ export async function resetPasswordWithToken(token, newPassword) {
   await run('UPDATE password_resets SET used = true WHERE token_hash = $1', [sessionTokenHash(token)])
   await run('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(newPassword), row.user_id])
   await run('DELETE FROM sessions WHERE user_id = $1', [row.user_id])
-  return createSession(row.user_id)
+  return createSession(row.user_id, userAgent)
+}
+
+export function totpConfigured() {
+  return Boolean(TOTP_ENC_KEY)
+}
+
+/** Starts enrollment: generates and stores a secret, but leaves 2FA off until confirmTotp succeeds. */
+export async function enrollTotp(userId) {
+  const user = await one('SELECT username FROM users WHERE id = $1', [userId])
+  const secret = new OTPAuth.Secret({ size: 20 })
+  const totp = new OTPAuth.TOTP({ issuer: TOTP_ISSUER, label: user.username, secret })
+  await run('UPDATE users SET totp_secret = $1, totp_enabled = false WHERE id = $2', [encryptTotpSecret(secret.base32), userId])
+  await run('DELETE FROM totp_backup_codes WHERE user_id = $1', [userId])
+  return { secret: secret.base32, otpauthUrl: totp.toString() }
+}
+
+/** Confirms enrollment with a live code, flips 2FA on, and mints a fresh set of backup codes
+ *  (returned in plaintext exactly once — only their hashes are ever persisted). */
+export async function confirmTotp(userId, code) {
+  const user = await one('SELECT totp_secret FROM users WHERE id = $1', [userId])
+  if (!user?.totp_secret) throw appError('Сначала подключите 2FA — запросите QR-код заново')
+  const secret = OTPAuth.Secret.fromBase32(decryptTotpSecret(user.totp_secret))
+  const delta = OTPAuth.TOTP.validate({ secret, token: String(code || '').trim(), window: 1 })
+  if (delta === null) throw appError('Неверный код', 401, 'INVALID_TOTP')
+  await run('UPDATE users SET totp_enabled = true WHERE id = $1', [userId])
+  await run('DELETE FROM totp_backup_codes WHERE user_id = $1', [userId])
+  const codes = Array.from({ length: BACKUP_CODE_COUNT }, generateBackupCode)
+  const now = Date.now()
+  for (const code of codes) {
+    await run('INSERT INTO totp_backup_codes (user_id, code_hash, created_at) VALUES ($1, $2, $3)', [userId, backupCodeHash(code), now])
+  }
+  audit('auth.2fa_enabled', { userId })
+  return { backupCodes: codes }
+}
+
+export async function disableTotp(userId, password) {
+  const user = await one('SELECT * FROM users WHERE id = $1', [userId])
+  if (!(await verifyPassword(password ?? '', user.password_hash))) throw appError('Неверный пароль', 401, 'INVALID_PASSWORD')
+  await run('UPDATE users SET totp_secret = NULL, totp_enabled = false WHERE id = $1', [userId])
+  await run('DELETE FROM totp_backup_codes WHERE user_id = $1', [userId])
+  audit('auth.2fa_disabled', { userId })
+}
+
+/** Accepts either a live 6-digit TOTP code or a one-time backup code (case-insensitive). */
+async function verifyTotpOrBackupCode(userId, code) {
+  const trimmed = String(code || '').trim()
+  if (!trimmed) return false
+  const user = await one('SELECT totp_secret FROM users WHERE id = $1', [userId])
+  if (!user?.totp_secret) return false
+  if (/^\d{6}$/.test(trimmed)) {
+    const secret = OTPAuth.Secret.fromBase32(decryptTotpSecret(user.totp_secret))
+    return OTPAuth.TOTP.validate({ secret, token: trimmed, window: 1 }) !== null
+  }
+  const hash = backupCodeHash(trimmed.toUpperCase())
+  const row = await one('SELECT id FROM totp_backup_codes WHERE user_id = $1 AND code_hash = $2 AND used = false', [userId, hash])
+  if (!row) return false
+  await run('UPDATE totp_backup_codes SET used = true WHERE id = $1', [row.id])
+  return true
 }

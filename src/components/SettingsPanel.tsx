@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import QRCode from 'qrcode'
+import { showToast } from '../hooks/useToast'
 import type { BlockedUser, User } from '../types'
 import type {
   AccentPreference,
@@ -14,7 +16,7 @@ import type {
   ThemePreference,
   WallpaperPreference,
 } from '../hooks/usePreferences'
-import { getBlockedUsers, uploadFile, unblockUser as apiUnblockUser } from '../api/client'
+import { getBlockedUsers, uploadFile, unblockUser as apiUnblockUser, getSessions, revokeSession as apiRevokeSession, revokeOtherSessions as apiRevokeOtherSessions, type SessionInfo, enrollTotp, confirmTotp, disableTotp } from '../api/client'
 import { AvatarImage } from './AvatarImage'
 import { AvatarLightbox } from './AvatarLightbox'
 import { ColorPicker } from './ColorPicker'
@@ -99,6 +101,7 @@ interface SettingsPanelProps {
   onChangePassword: (oldPassword: string, newPassword: string) => Promise<unknown>
   onRequestEmailVerification: (email: string) => Promise<unknown>
   onRemoveEmail: () => Promise<unknown>
+  onRefreshUser: () => Promise<unknown>
   onClose: () => void
 }
 
@@ -266,6 +269,285 @@ function BlockedUsersSettings() {
   )
 }
 
+/** Грубая расшифровка User-Agent для отображения — не претендует на точность, просто ориентир. */
+function describeUserAgent(ua: string | null): string {
+  if (!ua) return 'Неизвестное устройство'
+  const os = /Windows/.test(ua) ? 'Windows' : /Mac OS/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Linux/.test(ua) ? 'Linux' : 'Устройство'
+  const browser = /Electron/.test(ua) ? 'CorNet Desktop' : /Edg\//.test(ua) ? 'Edge' : /Firefox/.test(ua) ? 'Firefox' : /Chrome/.test(ua) ? 'Chrome' : /Safari/.test(ua) ? 'Safari' : 'Браузер'
+  return `${browser} · ${os}`
+}
+
+function formatSessionDate(timestamp: number) {
+  return new Date(timestamp).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+}
+
+function SessionsSettings() {
+  const [sessions, setSessions] = useState<SessionInfo[] | null>(null)
+  const [revokingId, setRevokingId] = useState<string | null>(null)
+  const [revokingRest, setRevokingRest] = useState(false)
+
+  function load() {
+    getSessions()
+      .then((res) => setSessions(res.sessions))
+      .catch(() => setSessions([]))
+  }
+
+  useEffect(() => {
+    let active = true
+    getSessions()
+      .then((res) => active && setSessions(res.sessions))
+      .catch(() => active && setSessions([]))
+    return () => {
+      active = false
+    }
+  }, [])
+
+  async function handleRevoke(id: string) {
+    setRevokingId(id)
+    try {
+      await apiRevokeSession(id)
+      setSessions((prev) => prev?.filter((s) => s.id !== id) ?? null)
+    } finally {
+      setRevokingId(null)
+    }
+  }
+
+  async function handleRevokeOthers() {
+    setRevokingRest(true)
+    try {
+      await apiRevokeOtherSessions()
+      load()
+    } finally {
+      setRevokingRest(false)
+    }
+  }
+
+  const otherCount = sessions?.filter((s) => !s.isCurrent).length ?? 0
+
+  return (
+    <section className="settings-card">
+      <div className="settings-card-title">
+        <h3>Сессии и устройства</h3>
+        <p>Все места, где выполнен вход в ваш аккаунт</p>
+      </div>
+      {sessions === null ? (
+        <p className="field-hint"><SpinnerIcon width={13} height={13} /> Загрузка…</p>
+      ) : sessions.length === 0 ? (
+        <p className="field-hint">Нет активных сессий</p>
+      ) : (
+        <div className="settings-blocked-list">
+          {sessions.map((s) => (
+            <div className="settings-control-row" key={s.id}>
+              <span className="settings-control-copy">
+                <strong>{describeUserAgent(s.userAgent)}{s.isCurrent ? ' · эта сессия' : ''}</strong>
+                <small>Последняя активность: {formatSessionDate(s.lastSeenAt)}</small>
+              </span>
+              {!s.isCurrent && (
+                <button
+                  className="settings-button settings-button--ghost"
+                  onClick={() => void handleRevoke(s.id)}
+                  disabled={revokingId === s.id}
+                >
+                  {revokingId === s.id && <SpinnerIcon width={14} height={14} />}
+                  Завершить
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {otherCount > 0 && (
+        <button className="settings-button settings-button--ghost" onClick={() => void handleRevokeOthers()} disabled={revokingRest}>
+          {revokingRest && <SpinnerIcon width={14} height={14} />}
+          Завершить все остальные сессии ({otherCount})
+        </button>
+      )}
+    </section>
+  )
+}
+
+function ShareProfileCard({ username }: { username: string }) {
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
+  const link = `${window.location.origin}/?startChat=${encodeURIComponent(username)}`
+
+  useEffect(() => {
+    let active = true
+    QRCode.toDataURL(link, { width: 168, margin: 1 })
+      .then((url) => active && setQrDataUrl(url))
+      .catch(() => active && setQrDataUrl(null))
+    return () => {
+      active = false
+    }
+  }, [link])
+
+  function copyLink() {
+    navigator.clipboard
+      .writeText(link)
+      .then(() => showToast('Ссылка скопирована'))
+      .catch(() => showToast('Не удалось скопировать ссылку'))
+  }
+
+  return (
+    <section className="settings-card settings-share-profile">
+      <div className="settings-card-title">
+        <h3>Поделиться профилем</h3>
+        <p>Переход по ссылке сразу откроет чат с вами</p>
+      </div>
+      <div className="settings-share-profile__body">
+        {qrDataUrl && <img className="settings-share-profile__qr" src={qrDataUrl} alt="QR-код для перехода в чат" width={140} height={140} />}
+        <div className="settings-share-profile__link-row">
+          <input className="text-input" readOnly value={link} onFocus={(e) => e.currentTarget.select()} aria-label="Ссылка-приглашение" />
+          <button className="settings-button settings-button--primary" onClick={copyLink} type="button">Копировать</button>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function TwoFactorSettings({ user, onChanged }: { user: User; onChanged: () => void }) {
+  const [step, setStep] = useState<'idle' | 'enrolling' | 'backup-codes' | 'disabling'>('idle')
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
+  const [secret, setSecret] = useState('')
+  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [backupCodes, setBackupCodes] = useState<string[]>([])
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null)
+
+  async function startEnroll() {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const res = await enrollTotp()
+      setSecret(res.secret)
+      const dataUrl = await QRCode.toDataURL(res.otpauthUrl, { width: 200, margin: 1 })
+      setQrDataUrl(dataUrl)
+      setStep('enrolling')
+    } catch (err) {
+      setMessage({ text: (err as Error).message, error: true })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function submitEnrollCode() {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const res = await confirmTotp(code.trim())
+      setBackupCodes(res.backupCodes)
+      setStep('backup-codes')
+      setCode('')
+      onChanged()
+    } catch (err) {
+      setMessage({ text: (err as Error).message, error: true })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function submitDisable() {
+    setBusy(true)
+    setMessage(null)
+    try {
+      await disableTotp(password)
+      setPassword('')
+      setStep('idle')
+      onChanged()
+    } catch (err) {
+      setMessage({ text: (err as Error).message, error: true })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function finishBackupCodes() {
+    setStep('idle')
+    setQrDataUrl(null)
+    setSecret('')
+    setBackupCodes([])
+  }
+
+  function cancel() {
+    setStep('idle')
+    setMessage(null)
+    setCode('')
+    setPassword('')
+  }
+
+  return (
+    <section className="settings-card">
+      <div className="settings-card-title">
+        <h3>Двухфакторная аутентификация</h3>
+        <p>Код из приложения-аутентификатора (Google Authenticator, Aegis и похожие) при каждом входе</p>
+      </div>
+
+      {step === 'idle' && (
+        <div className="settings-control-row">
+          <span className="settings-control-copy">
+            <strong>{user.totpEnabled ? 'Включена' : 'Выключена'}</strong>
+            <small>{user.totpEnabled ? 'Вход требует код из приложения' : 'Защитите вход дополнительным кодом'}</small>
+          </span>
+          <button
+            className={`settings-button ${user.totpEnabled ? 'settings-button--ghost' : 'settings-button--primary'}`}
+            onClick={() => void (user.totpEnabled ? setStep('disabling') : startEnroll())}
+            disabled={busy}
+          >
+            {busy && <SpinnerIcon width={14} height={14} />}
+            {user.totpEnabled ? 'Отключить' : 'Включить'}
+          </button>
+        </div>
+      )}
+
+      {step === 'enrolling' && (
+        <div className="settings-2fa-enroll">
+          {qrDataUrl && <img src={qrDataUrl} alt="QR-код для приложения-аутентификатора" width={180} height={180} />}
+          <p className="field-hint">Отсканируйте QR в приложении-аутентификаторе, либо введите код вручную: <code>{secret}</code></p>
+          <div className="field">
+            <label htmlFor="totp-confirm-code">Код из приложения</label>
+            <input id="totp-confirm-code" className="text-input" value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" maxLength={6} autoComplete="one-time-code" />
+          </div>
+          {message && <div className={`form-banner ${message.error ? 'form-banner--error' : 'form-banner--success'}`}>{message.error && <AlertIcon width={15} height={15} />}{message.text}</div>}
+          <div className="settings-2fa-enroll__actions">
+            <button className="settings-button settings-button--primary" onClick={() => void submitEnrollCode()} disabled={busy || code.trim().length !== 6}>
+              {busy && <SpinnerIcon width={14} height={14} />}
+              Подтвердить
+            </button>
+            <button className="settings-button settings-button--ghost" onClick={cancel} disabled={busy}>Отмена</button>
+          </div>
+        </div>
+      )}
+
+      {step === 'backup-codes' && (
+        <div className="settings-2fa-enroll">
+          <p className="field-hint">2FA включена. Сохраните резервные коды — каждый работает один раз и заменяет код из приложения, если телефон недоступен.</p>
+          <div className="settings-2fa-backup-codes">
+            {backupCodes.map((c) => <code key={c}>{c}</code>)}
+          </div>
+          <button className="settings-button settings-button--primary" onClick={finishBackupCodes}>Я сохранил(а) коды</button>
+        </div>
+      )}
+
+      {step === 'disabling' && (
+        <div className="settings-2fa-enroll">
+          <div className="field">
+            <label htmlFor="totp-disable-password">Подтвердите паролем</label>
+            <input id="totp-disable-password" type="password" className="text-input" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+          </div>
+          {message && <div className={`form-banner ${message.error ? 'form-banner--error' : 'form-banner--success'}`}>{message.error && <AlertIcon width={15} height={15} />}{message.text}</div>}
+          <div className="settings-2fa-enroll__actions">
+            <button className="settings-button settings-button--primary" onClick={() => void submitDisable()} disabled={busy || !password}>
+              {busy && <SpinnerIcon width={14} height={14} />}
+              Отключить 2FA
+            </button>
+            <button className="settings-button settings-button--ghost" onClick={cancel} disabled={busy}>Отмена</button>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
 /** Выбор устройств: названия браузер показывает только после выданного доступа к микрофону. */
 function DeviceSettings({ preferences, onUpdatePreferences }: {
   preferences: AppPreferences
@@ -360,6 +642,7 @@ export function SettingsPanel({
   onChangePassword,
   onRequestEmailVerification,
   onRemoveEmail,
+  onRefreshUser,
   onClose,
 }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>('profile')
@@ -376,6 +659,7 @@ export function SettingsPanel({
   const [displayNameDraft, setDisplayNameDraft] = useState(user.displayName ?? '')
   const [usernameDraft, setUsernameDraft] = useState(user.username)
   const [bioDraft, setBioDraft] = useState(user.bio ?? '')
+  const [statusDraft, setStatusDraft] = useState(user.statusText ?? '')
   const [birthDateDraft, setBirthDateDraft] = useState(user.birthDate ?? '')
   const [avatarPreviewOpen, setAvatarPreviewOpen] = useState(false)
   const [profileFilter, setProfileFilter] = useState<ProfileFilter>('all')
@@ -431,7 +715,7 @@ export function SettingsPanel({
     )
   }
 
-  async function updateProfile(patch: { username?: string; color?: string; avatarUrl?: string | null; bannerUrl?: string | null; bannerStyle?: User['bannerStyle']; avatarDecoration?: User['avatarDecoration']; profileEffect?: User['profileEffect']; profileTheme?: User['profileTheme']; nameStyle?: User['nameStyle']; profileFrame?: User['profileFrame']; nameplateStyle?: User['nameplateStyle']; profilePrimaryColor?: string | null; profileSecondaryColor?: string | null; showLastSeen?: boolean; bio?: string; birthDate?: string | null; displayName?: string | null }) {
+  async function updateProfile(patch: { username?: string; color?: string; avatarUrl?: string | null; bannerUrl?: string | null; bannerStyle?: User['bannerStyle']; avatarDecoration?: User['avatarDecoration']; profileEffect?: User['profileEffect']; profileTheme?: User['profileTheme']; nameStyle?: User['nameStyle']; profileFrame?: User['profileFrame']; nameplateStyle?: User['nameplateStyle']; profilePrimaryColor?: string | null; profileSecondaryColor?: string | null; showLastSeen?: boolean; bio?: string; statusText?: string; birthDate?: string | null; displayName?: string | null }) {
     setSavingProfile(true)
     setProfileMessage(null)
     try {
@@ -454,6 +738,7 @@ export function SettingsPanel({
       username,
       displayName: displayNameDraft.trim() || null,
       bio: bioDraft.trim(),
+      statusText: statusDraft.trim(),
     })
     setUsernameDraft(username)
   }
@@ -660,6 +945,14 @@ export function SettingsPanel({
                           />
                         </label>
                         <span className="profile-card__presence-pill is-online">в сети</span>
+                        <input
+                          className="settings-live-inline-status"
+                          value={statusDraft}
+                          onChange={(e) => setStatusDraft(e.target.value)}
+                          maxLength={60}
+                          placeholder="Добавить статус…"
+                          aria-label="Статус"
+                        />
                       </div>
                       <div className="profile-card__panel">
                         <section className="profile-card__section">
@@ -675,7 +968,7 @@ export function SettingsPanel({
                           />
                         </section>
                       </div>
-                      <button className="settings-live-card-save" onClick={() => void savePreviewProfile()} disabled={savingProfile || (usernameDraft === user.username && displayNameDraft === (user.displayName ?? '') && bioDraft === (user.bio ?? ''))}>
+                      <button className="settings-live-card-save" onClick={() => void savePreviewProfile()} disabled={savingProfile || (usernameDraft === user.username && displayNameDraft === (user.displayName ?? '') && bioDraft === (user.bio ?? '') && statusDraft === (user.statusText ?? ''))}>
                         {savingProfile ? 'Сохранение…' : 'Сохранить'}
                       </button>
                     </div>
@@ -685,6 +978,7 @@ export function SettingsPanel({
                   </div>
                   <div className="profile-studio__controls">
                 <div className="profile-shop-search"><span>⌕</span><input value={profileSearch} onChange={(event) => setProfileSearch(event.target.value)} placeholder="Найти оформление…" aria-label="Поиск оформления" />{profileSearch && <button onClick={() => setProfileSearch('')} aria-label="Очистить поиск">×</button>}</div>
+                <ShareProfileCard username={user.username} />
                 <section ref={(node) => { profileSectionRefs.current.bundles = node }} className="settings-card profile-bundles-card profile-navigation-target">
                   <div className="settings-card-title"><h3>Готовые комплекты</h3><p>Сочетают обложку, украшение, эффект, имя и рамку в одной коллекции</p></div>
                   <div className="profile-bundle-options">
@@ -961,6 +1255,8 @@ export function SettingsPanel({
             {activeTab === 'security' && (
               <>
                 <EmailSettings user={user} onRequestVerification={onRequestEmailVerification} onRemoveEmail={onRemoveEmail} />
+                <TwoFactorSettings user={user} onChanged={() => void onRefreshUser()} />
+                <SessionsSettings />
                 <section className="settings-card"><div className="settings-card-title"><h3>Смена пароля</h3><p>Не менее 10 символов и минимум три разных вида символов</p></div><form className="settings-password-form" onSubmit={handlePasswordSubmit}><label htmlFor="old-password">Текущий пароль</label><input id="old-password" type={showPasswords ? 'text' : 'password'} className="text-input" value={oldPassword} onChange={(e) => setOldPassword(e.target.value)} autoComplete="current-password" /><label htmlFor="new-password">Новый пароль</label><input id="new-password" type={showPasswords ? 'text' : 'password'} className="text-input" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoComplete="new-password" minLength={10} maxLength={128} /><label htmlFor="confirm-password">Повторите новый пароль</label><input id="confirm-password" type={showPasswords ? 'text' : 'password'} className="text-input" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} autoComplete="new-password" minLength={10} maxLength={128} /><label className="settings-checkbox-row"><input type="checkbox" checked={showPasswords} onChange={(e) => setShowPasswords(e.target.checked)} />Показать пароли</label>{passwordMessage && <div className={`form-banner ${passwordMessage.error ? 'form-banner--error' : 'form-banner--success'}`}>{passwordMessage.error && <AlertIcon width={15} height={15} />}{passwordMessage.text}</div>}<button type="submit" className="settings-button settings-button--primary" disabled={savingPassword || !oldPassword || !newPassword || !confirmPassword}>{savingPassword && <SpinnerIcon width={15} height={15} />}Сохранить пароль</button></form></section>
               </>
             )}

@@ -6,6 +6,70 @@ interface AuthScreenProps {
   error: string | null
   onLogin: (username: string, password: string) => Promise<void>
   onRegister: (username: string, password: string) => Promise<void>
+  pendingTwoFactor: boolean
+  onVerifyTwoFactor: (code: string) => Promise<void>
+  onCancelTwoFactor: () => void
+}
+
+function TwoFactorForm({ error, onVerify, onCancel }: {
+  error: string | null
+  onVerify: (code: string) => Promise<void>
+  onCancel: () => void
+}) {
+  const [code, setCode] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setSubmitting(true)
+    try {
+      await onVerify(code.trim())
+    } catch {
+      // error surfaced via `error` prop
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <form className="auth-card" onSubmit={handleSubmit}>
+      <div className="auth-brand">
+        <div className="auth-mark">C</div>
+        <div>
+          <h1 className="auth-title notranslate" translate="no">CorNet</h1>
+          <p className="auth-subtitle">Код из приложения-аутентификатора</p>
+        </div>
+      </div>
+      <div className="field">
+        <label htmlFor="auth-2fa-code">Код или резервный код</label>
+        <input
+          id="auth-2fa-code"
+          type="text"
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          autoFocus
+          autoComplete="one-time-code"
+          inputMode="text"
+          placeholder="123456"
+          maxLength={11}
+        />
+        <small className="field-hint">6-значный код из приложения — либо один из сохранённых резервных кодов</small>
+      </div>
+      {error && (
+        <div className="form-banner form-banner--error">
+          <AlertIcon width={16} height={16} />
+          {error}
+        </div>
+      )}
+      <button type="submit" className="btn-primary" disabled={submitting || !code.trim()}>
+        {submitting && <SpinnerIcon width={16} height={16} />}
+        Подтвердить
+      </button>
+      <button type="button" className="btn-ghost" style={{ alignSelf: 'center' }} onClick={onCancel}>
+        Назад ко входу
+      </button>
+    </form>
+  )
 }
 
 function ForgotPasswordForm({ onBack }: { onBack: () => void }) {
@@ -77,7 +141,7 @@ function ForgotPasswordForm({ onBack }: { onBack: () => void }) {
   )
 }
 
-export function AuthScreen({ error, onLogin, onRegister }: AuthScreenProps) {
+export function AuthScreen({ error, onLogin, onRegister, pendingTwoFactor, onVerifyTwoFactor, onCancelTwoFactor }: AuthScreenProps) {
   const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -96,6 +160,14 @@ export function AuthScreen({ error, onLogin, onRegister }: AuthScreenProps) {
     setPassword('')
     setConfirmPassword('')
     setLocalError(null)
+  }
+
+  if (pendingTwoFactor) {
+    return (
+      <div className="auth-shell">
+        <TwoFactorForm error={error} onVerify={onVerifyTwoFactor} onCancel={onCancelTwoFactor} />
+      </div>
+    )
   }
 
   if (mode === 'forgot') {

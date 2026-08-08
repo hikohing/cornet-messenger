@@ -12,6 +12,7 @@
     "express": "^4.21.0",
     "express-rate-limit": "^8.6.1",
     "multer": "^2.0.1",
+    "otpauth": "^9.5.1",
     "pg": "^8.22.0",
     "ws": "^8.18.0"
   }

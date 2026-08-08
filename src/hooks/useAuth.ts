@@ -7,6 +7,7 @@ export function useAuth() {
   const [token, setTokenState] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [pendingTwoFactorToken, setPendingTwoFactorToken] = useState<string | null>(null)
 
   useEffect(() => {
     let active = true
@@ -33,6 +34,10 @@ export function useAuth() {
     setError(null)
     try {
       const res = await api.login(username, password)
+      if ('twoFactorRequired' in res) {
+        setPendingTwoFactorToken(res.pendingToken)
+        return
+      }
       api.clearToken()
       setTokenState('cookie-session')
       setUser(res.user)
@@ -40,6 +45,26 @@ export function useAuth() {
       setError((err as Error).message)
       throw err
     }
+  }
+
+  async function verifyTwoFactor(code: string) {
+    if (!pendingTwoFactorToken) return
+    setError(null)
+    try {
+      const res = await api.verifyTwoFactorLogin(pendingTwoFactorToken, code)
+      api.clearToken()
+      setTokenState('cookie-session')
+      setUser(res.user)
+      setPendingTwoFactorToken(null)
+    } catch (err) {
+      setError((err as Error).message)
+      throw err
+    }
+  }
+
+  function cancelTwoFactor() {
+    setPendingTwoFactorToken(null)
+    setError(null)
   }
 
   async function register(username: string, password: string) {
@@ -78,6 +103,7 @@ export function useAuth() {
     profileSecondaryColor?: string | null
     showLastSeen?: boolean
     bio?: string
+    statusText?: string
     birthDate?: string | null
     displayName?: string | null
   }) {
@@ -93,5 +119,18 @@ export function useAuth() {
     return res.user
   }
 
-  return { user, token, loading, error, login, register, logout, updateProfile, refreshUser }
+  return {
+    user,
+    token,
+    loading,
+    error,
+    login,
+    register,
+    logout,
+    updateProfile,
+    refreshUser,
+    pendingTwoFactor: pendingTwoFactorToken !== null,
+    verifyTwoFactor,
+    cancelTwoFactor,
+  }
 }

@@ -20,6 +20,7 @@ function toPublicUserRow(row) {
     profilePrimaryColor: row.profile_primary_color,
     profileSecondaryColor: row.profile_secondary_color,
     showLastSeen: row.show_last_seen,
+    statusText: row.status_text ?? '',
     bio: row.bio ?? '',
     birthDate: row.birth_date,
     lastSeenAt: row.last_seen_at ? Number(row.last_seen_at) : null,
@@ -125,7 +126,7 @@ export async function createGroupChat(creatorId, name, usernames) {
 export async function hydrateChat(chatId, viewerId) {
   const chatRow = await one('SELECT id, type, name, description, avatar_url, pinned_message_id FROM chats WHERE id = $1', [chatId])
   const memberRows = await many(
-    `SELECT users.id, users.username, users.display_name, users.color, users.avatar_url, users.banner_url, users.banner_style, users.avatar_decoration, users.profile_effect, users.profile_theme, users.name_style, users.profile_frame, users.nameplate_style, users.profile_primary_color, users.profile_secondary_color, users.show_last_seen, users.bio, users.birth_date, users.last_seen_at, users.created_at
+    `SELECT users.id, users.username, users.display_name, users.color, users.avatar_url, users.banner_url, users.banner_style, users.avatar_decoration, users.profile_effect, users.profile_theme, users.name_style, users.profile_frame, users.nameplate_style, users.profile_primary_color, users.profile_secondary_color, users.show_last_seen, users.status_text, users.bio, users.birth_date, users.last_seen_at, users.created_at
      FROM chat_members JOIN users ON users.id = chat_members.user_id WHERE chat_members.chat_id = $1`,
     [chatId],
   )

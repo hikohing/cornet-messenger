@@ -71,6 +71,7 @@ function ProfileCard({ user, onOpenAvatar, blocked, onToggleBlock }: {
         <h4 className={`profile-name--${user.nameStyle ?? 'plain'}`}>{displayName}</h4>
         <p className="profile-card__handle">@{user.username}</p>
         <span className={`profile-card__presence-pill${user.online ? ' is-online' : ''}`}>{presence}</span>
+        {user.statusText?.trim() && <p className="profile-card__status">{user.statusText}</p>}
       </div>
 
       <div className="profile-card__panel">

@@ -39,8 +39,22 @@ function useLinkParam(name: string) {
 function App() {
   const [resetToken, clearResetToken] = useLinkParam('resetToken')
   const [verifyEmailToken, clearVerifyEmailToken] = useLinkParam('verifyEmail')
+  const [startChatUsername, clearStartChatUsername] = useLinkParam('startChat')
   const { preferences, updatePreferences, resetPreferences } = usePreferences()
-  const { user, token, loading, error, login, register, logout, updateProfile, refreshUser } = useAuth()
+  const {
+    user,
+    token,
+    loading,
+    error,
+    login,
+    register,
+    logout,
+    updateProfile,
+    refreshUser,
+    pendingTwoFactor,
+    verifyTwoFactor,
+    cancelTwoFactor,
+  } = useAuth()
   const {
     chats,
     chatsLoaded,
@@ -90,6 +104,26 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId])
 
+  // Ссылка-приглашение (?startChat=username): открывает/создаёт личный чат сразу
+  // после входа, независимо от того, был ли человек уже залогинен в этом браузере.
+  useEffect(() => {
+    if (!user || !chatsLoaded || !startChatUsername) return
+    let cancelled = false
+    startChat(startChatUsername)
+      .then((chat) => {
+        if (cancelled) return
+        setSelectedChatId(chat.id)
+      })
+      .catch(() => showToast('Не удалось начать чат: пользователь не найден'))
+      .finally(() => {
+        if (!cancelled) clearStartChatUsername()
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, chatsLoaded, startChatUsername])
+
   useEffect(() => {
     if (selectedChatId !== null && chatsLoaded && !chats.some((c) => c.id === selectedChatId)) {
       setSelectedChatId(null)
@@ -115,7 +149,14 @@ function App() {
   if (!user) {
     return (
       <>
-        <AuthScreen error={error} onLogin={login} onRegister={register} />
+        <AuthScreen
+          error={error}
+          onLogin={login}
+          onRegister={register}
+          pendingTwoFactor={pendingTwoFactor}
+          onVerifyTwoFactor={verifyTwoFactor}
+          onCancelTwoFactor={cancelTwoFactor}
+        />
         <ToastHost />
       </>
     )
@@ -243,6 +284,7 @@ function App() {
           onChangePassword={(oldPassword, newPassword) => apiChangePassword(oldPassword, newPassword)}
           onRequestEmailVerification={(email) => apiRequestEmailVerification(email)}
           onRemoveEmail={() => apiRemoveEmail().then(() => refreshUser())}
+          onRefreshUser={refreshUser}
           preferences={preferences}
           onUpdatePreferences={updatePreferences}
           onResetPreferences={resetPreferences}

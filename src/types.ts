@@ -15,6 +15,7 @@ export interface User {
   profilePrimaryColor?: string | null
   profileSecondaryColor?: string | null
   showLastSeen?: boolean
+  statusText?: string
   bio?: string
   birthDate?: string | null
   lastSeenAt?: number | null
@@ -23,6 +24,7 @@ export interface User {
   /** Присутствуют только в приватном объекте текущего пользователя (не в чужих профилях). */
   email?: string | null
   emailVerified?: boolean
+  totpEnabled?: boolean
 }
 
 export interface BlockedUser {

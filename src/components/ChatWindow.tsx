@@ -101,9 +101,11 @@ function statusLabel(chat: Chat, other: Chat['members'][number] | undefined) {
   if (chat.type === 'group') return `${chat.members.length} участников`
   if (chat.type === 'saved') return 'Личные заметки'
   if (!other) return ''
-  if (other.online) return 'в сети'
-  if (other.showLastSeen && other.lastSeenAt) return `был(а) в сети в ${formatTime(other.lastSeenAt)}`
-  return 'не в сети'
+  const status = other.statusText?.trim()
+  const suffix = status ? ` · ${status}` : ''
+  if (other.online) return `в сети${suffix}`
+  if (other.showLastSeen && other.lastSeenAt) return `был(а) в сети в ${formatTime(other.lastSeenAt)}${suffix}`
+  return `не в сети${suffix}`
 }
 
 export function ChatWindow({
