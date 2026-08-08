@@ -1,0 +1,15 @@
+{
+  "name": "connecto-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Windows desktop client for CorNet with mirror failover for restricted networks",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}

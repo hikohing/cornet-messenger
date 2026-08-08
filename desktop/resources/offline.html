@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Connecto</title>
+<style>
+  body {
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0f1115;
+    color: #e6e8eb;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  .box { text-align: center; max-width: 360px; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  p { color: #9aa2ad; font-size: 14px; line-height: 1.5; margin: 0 0 20px; }
+  button {
+    background: #4d8dff;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #3b7ae0; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>Нет связи ни с одним сервером</h1>
+    <p>Все известные адреса Connecto сейчас недоступны. Это может быть блокировка сети или временный сбой сервера.</p>
+    <button id="retry">Повторить попытку</button>
+  </div>
+  <script>
+    document.getElementById('retry').addEventListener('click', () => {
+      window.location.href = 'connecto-retry://'
+    })
+  </script>
+</body>
+</html>

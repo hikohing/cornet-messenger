@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-ssr
+.pgportable
+server/uploads
+.claude
+*.log
+*.local
+*.db
+desktop

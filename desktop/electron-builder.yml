@@ -1,0 +1,20 @@
+appId: com.connecto.desktop
+productName: CorNet
+directories:
+  output: release
+files:
+  - src/**/*
+  - package.json
+extraResources:
+  - from: resources/mirrors.default.json
+    to: mirrors.default.json
+  - from: resources/offline.html
+    to: offline.html
+win:
+  target:
+    - nsis
+    - portable
+nsis:
+  oneClick: false
+  perMachine: true
+  allowToChangeInstallationDirectory: true

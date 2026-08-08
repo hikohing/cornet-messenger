@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "mirrors": ["https://web-messenger-production-3f4e.up.railway.app"],
+  "remoteUpdateUrl": null
+}

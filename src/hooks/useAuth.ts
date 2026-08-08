@@ -1,0 +1,97 @@
+import { useEffect, useState } from 'react'
+import * as api from '../api/client'
+import type { User } from '../types'
+
+export function useAuth() {
+  const [user, setUser] = useState<User | null>(null)
+  const [token, setTokenState] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let active = true
+    api
+      .getMe()
+      .then((res) => {
+        if (!active) return
+        api.clearToken()
+        setUser(res.user)
+        setTokenState('cookie-session')
+      })
+      .catch(() => {
+        if (!active) return
+        api.clearToken()
+        setTokenState(null)
+      })
+      .finally(() => active && setLoading(false))
+    return () => {
+      active = false
+    }
+  }, [])
+
+  async function login(username: string, password: string) {
+    setError(null)
+    try {
+      const res = await api.login(username, password)
+      api.clearToken()
+      setTokenState('cookie-session')
+      setUser(res.user)
+    } catch (err) {
+      setError((err as Error).message)
+      throw err
+    }
+  }
+
+  async function register(username: string, password: string) {
+    setError(null)
+    try {
+      const res = await api.register(username, password)
+      api.clearToken()
+      setTokenState('cookie-session')
+      setUser(res.user)
+    } catch (err) {
+      setError((err as Error).message)
+      throw err
+    }
+  }
+
+  function logout() {
+    void api.logout().catch(() => undefined)
+    api.clearToken()
+    setTokenState(null)
+    setUser(null)
+  }
+
+  async function updateProfile(patch: {
+    username?: string
+    color?: string
+    avatarUrl?: string | null
+    bannerUrl?: string | null
+    bannerStyle?: User['bannerStyle']
+    avatarDecoration?: User['avatarDecoration']
+    profileEffect?: User['profileEffect']
+    profileTheme?: User['profileTheme']
+    nameStyle?: User['nameStyle']
+    profileFrame?: User['profileFrame']
+    nameplateStyle?: User['nameplateStyle']
+    profilePrimaryColor?: string | null
+    profileSecondaryColor?: string | null
+    showLastSeen?: boolean
+    bio?: string
+    birthDate?: string | null
+    displayName?: string | null
+  }) {
+    const res = await api.updateProfile(patch)
+    setUser(res.user)
+    return res.user
+  }
+
+  /** Подхватывает поля вроде email/emailVerified, изменённые в обход updateProfile (отвязка почты). */
+  async function refreshUser() {
+    const res = await api.getMe()
+    setUser(res.user)
+    return res.user
+  }
+
+  return { user, token, loading, error, login, register, logout, updateProfile, refreshUser }
+}
