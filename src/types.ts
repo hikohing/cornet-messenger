@@ -5,13 +5,13 @@ export interface User {
   color: string
   avatarUrl?: string | null
   bannerUrl?: string | null
-  bannerStyle?: 'profile' | 'ocean' | 'sunset' | 'aurora' | 'midnight' | 'berry' | 'gold' | 'mono'
-  avatarDecoration?: 'none' | 'ring' | 'neon' | 'sparkles' | 'double' | 'halo' | 'petals' | 'flames' | 'bubbles' | 'pixel' | 'frost' | 'vines'
-  profileEffect?: 'none' | 'glow' | 'aurora' | 'grid' | 'holo' | 'stars' | 'confetti' | 'rain' | 'pulse' | 'scan' | 'sakura' | 'comet'
-  profileTheme?: 'default' | 'night' | 'berry' | 'ocean' | 'forest'
-  nameStyle?: 'plain' | 'accent' | 'gradient' | 'glow' | 'mono'
-  profileFrame?: 'none' | 'accent' | 'glass' | 'gold' | 'neon'
-  nameplateStyle?: 'none' | 'cosmic' | 'sakura' | 'arcade' | 'forest' | 'gold'
+  bannerStyle?: 'profile' | 'ocean' | 'sunset' | 'aurora' | 'midnight' | 'berry' | 'gold' | 'mono' | 'coral' | 'mint' | 'lavender' | 'crimson' | 'emerald' | 'graphite' | 'peach' | 'indigo'
+  avatarDecoration?: 'none' | 'ring' | 'neon' | 'sparkles' | 'double' | 'halo' | 'petals' | 'flames' | 'bubbles' | 'pixel' | 'frost' | 'vines' | 'comet' | 'aurora' | 'gold' | 'shadow'
+  profileEffect?: 'none' | 'glow' | 'aurora' | 'grid' | 'holo' | 'stars' | 'confetti' | 'rain' | 'pulse' | 'scan' | 'sakura' | 'comet' | 'snow' | 'embers' | 'matrix' | 'ripple'
+  profileTheme?: 'default' | 'night' | 'berry' | 'ocean' | 'forest' | 'sunset' | 'crimson' | 'emerald' | 'graphite' | 'rose'
+  nameStyle?: 'plain' | 'accent' | 'gradient' | 'glow' | 'mono' | 'shadow' | 'outline' | 'neon'
+  profileFrame?: 'none' | 'accent' | 'glass' | 'gold' | 'neon' | 'ice' | 'fire' | 'shadow' | 'emerald' | 'rose'
+  nameplateStyle?: 'none' | 'cosmic' | 'sakura' | 'arcade' | 'forest' | 'gold' | 'ocean' | 'crimson' | 'midnight' | 'royal'
   profilePrimaryColor?: string | null
   profileSecondaryColor?: string | null
   showLastSeen?: boolean

@@ -21,7 +21,10 @@ import { ColorPicker } from './ColorPicker'
 import { AlertIcon, CameraIcon, CheckIcon, CloseIcon, SpinnerIcon } from './icons'
 import { AVATAR_DECORATIONS, BANNER_STYLES, NAMEPLATES, NAME_STYLES, PROFILE_BUNDLES, PROFILE_EFFECTS, PROFILE_FRAMES, PROFILE_THEMES, profileBannerStyle, profileCardColorStyle } from '../utils/profile'
 
-const COLOR_PALETTE = ['#6e56cf', '#00b894', '#0984e3', '#e17055', '#d63031', '#00cec9', '#e84393', '#fdcb6e']
+const COLOR_PALETTE = [
+  '#6e56cf', '#00b894', '#0984e3', '#e17055', '#d63031', '#00cec9', '#e84393', '#fdcb6e',
+  '#22c55e', '#3b82f6', '#a855f7', '#f97316', '#14b8a6', '#f43f5e', '#84cc16', '#64748b',
+]
 type SettingsTab = 'profile' | 'appearance' | 'effects' | 'notifications' | 'calls' | 'chats' | 'privacy' | 'security' | 'about'
 type ProfileFilter = 'all' | 'bundles' | 'theme' | 'banner' | 'avatar' | 'effects' | 'identity'
 

@@ -11,6 +11,7 @@ import type { ConnectionStatus } from '../api/socket'
 import { useEscapeToClose } from '../hooks/useEscapeToClose'
 import { useContextMenu } from '../hooks/useContextMenu'
 import {
+  ArrowDownIcon,
   AttachIcon,
   BackIcon,
   ChatBubbleIcon,
@@ -160,7 +161,6 @@ export function ChatWindow({
     }
     if (searchOpen) setSearchOpen(false)
   })
-  const bottomRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -178,12 +178,72 @@ export function ChatWindow({
   const searchRequestRef = useRef(0)
   const selectionDragRef = useRef({ active: false, selected: true, visited: new Set<number>() })
   const selectionPointerStartRef = useRef<{ messageId: number; x: number; y: number } | null>(null)
-  const selectionActivationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const selectionClickSuppressUntilRef = useRef(0)
 
+  // Автоскролл «как в мессенджере»: прыгаем вниз только если пользователь уже
+  // читает конец ленты или сам отправил сообщение. Иначе не вырываем его из
+  // истории, а копим счётчик на кнопке «вниз».
+  const atBottomRef = useRef(true)
+  const prevChatIdRef = useRef<number | null>(null)
+  const prevCountRef = useRef(0)
+  const chatSettledRef = useRef(false)
+  const [unseenCount, setUnseenCount] = useState(0)
+  const [showScrollDown, setShowScrollDown] = useState(false)
+
+  const scrollToBottom = useCallback((smooth = false) => {
+    const el = containerRef.current
+    if (!el) return
+    const reduced =
+      document.documentElement.dataset.reducedMotion === 'true' ||
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduced ? 'smooth' : 'auto' })
+    atBottomRef.current = true
+    setUnseenCount(0)
+    setShowScrollDown(false)
+  }, [])
+
+  const handleListScroll = useCallback(() => {
+    const el = containerRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    const atBottom = distanceFromBottom < 80
+    atBottomRef.current = atBottom
+    setShowScrollDown(!atBottom && el.scrollHeight - el.clientHeight > 160)
+    if (atBottom) setUnseenCount(0)
+  }, [])
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'auto' })
-  }, [messages])
+    if (prevChatIdRef.current !== currentChatId) {
+      prevChatIdRef.current = currentChatId
+      prevCountRef.current = messages.length
+      chatSettledRef.current = messages.length > 0
+      atBottomRef.current = true
+      setUnseenCount(0)
+      setShowScrollDown(false)
+      scrollToBottom()
+      return
+    }
+
+    const grew = messages.length > prevCountRef.current
+    const added = messages.length - prevCountRef.current
+    prevCountRef.current = messages.length
+    if (!grew) return
+
+    // Первая порция истории после открытия чата — встаём внизу без анимации.
+    if (!chatSettledRef.current) {
+      chatSettledRef.current = true
+      scrollToBottom()
+      return
+    }
+
+    const last = messages[messages.length - 1]
+    if (atBottomRef.current || last?.senderId === currentUserId) {
+      scrollToBottom(true)
+    } else {
+      setUnseenCount((n) => n + added)
+      setShowScrollDown(true)
+    }
+  }, [messages, currentChatId, currentUserId, scrollToBottom])
 
   useEffect(() => {
     if (!showComposerEmoji) return
@@ -208,8 +268,6 @@ export function ChatWindow({
     function stopSelectionDrag() {
       selectionDragRef.current.active = false
       selectionPointerStartRef.current = null
-      if (selectionActivationTimerRef.current) clearTimeout(selectionActivationTimerRef.current)
-      selectionActivationTimerRef.current = null
     }
     document.addEventListener('pointerup', stopSelectionDrag)
     document.addEventListener('pointercancel', stopSelectionDrag)
@@ -468,7 +526,7 @@ export function ChatWindow({
 
   const headerColor = chat.type === 'group' ? '#3a3a44' : chat.type === 'saved' ? '#4a4a56' : other?.color
   const selectedMessages = messages.filter((message) => selectedMessageIds.has(message.id))
-  const deletableSelectedMessages = selectedMessages.filter((message) => message.senderId === currentUserId && !message.pending)
+  const deletableSelectedMessages = selectedMessages.filter((message) => !message.pending)
 
   function toggleMessageSelected(message: Message) {
     if (message.pending || message.deleted) return
@@ -490,16 +548,12 @@ export function ChatWindow({
     setMessageSelected(message, selected)
   }
 
+  // Mouse selection only starts once the pointer actually moves past the drag
+  // threshold (see activatePreparedSelection) — a plain left-click-and-hold must
+  // never by itself drop the user into multi-select, or it fights with normal
+  // clicking/text selection. Touch keeps its own long-press path (useLongPress).
   function prepareDirectSelection(message: Message, x: number, y: number) {
     selectionPointerStartRef.current = { messageId: message.id, x, y }
-    if (selectionActivationTimerRef.current) clearTimeout(selectionActivationTimerRef.current)
-    selectionActivationTimerRef.current = setTimeout(() => {
-      const pending = selectionPointerStartRef.current
-      if (!pending || pending.messageId !== message.id) return
-      selectionPointerStartRef.current = null
-      selectionClickSuppressUntilRef.current = Date.now() + 600
-      startSelectionDrag(message, true)
-    }, 240)
   }
 
   function activatePreparedSelection(x: number, y: number) {
@@ -507,8 +561,6 @@ export function ChatWindow({
     if (!pending || Math.hypot(x - pending.x, y - pending.y) < 7) return false
     const message = messages.find((item) => item.id === pending.messageId)
     selectionPointerStartRef.current = null
-    if (selectionActivationTimerRef.current) clearTimeout(selectionActivationTimerRef.current)
-    selectionActivationTimerRef.current = null
     if (!message || message.type === 'call') return false
     selectionClickSuppressUntilRef.current = Date.now() + 600
     startSelectionDrag(message, true)
@@ -773,6 +825,7 @@ export function ChatWindow({
       <div
         className={`message-list${selectedMessages.length > 0 ? ' is-selecting' : ''}`}
         ref={containerRef}
+        onScroll={handleListScroll}
         onClickCapture={(event) => {
           if (Date.now() >= selectionClickSuppressUntilRef.current) return
           selectionClickSuppressUntilRef.current = 0
@@ -884,7 +937,21 @@ export function ChatWindow({
             )
           })
         )}
-        <div ref={bottomRef} />
+        <div className="message-list__anchor">
+          <button
+            type="button"
+            className={`scroll-down-fab${showScrollDown ? ' is-visible' : ''}`}
+            onClick={() => scrollToBottom(true)}
+            tabIndex={showScrollDown ? 0 : -1}
+            aria-hidden={!showScrollDown}
+            title={unseenCount > 0 ? `Новых сообщений: ${unseenCount}` : 'К последнему сообщению'}
+          >
+            <ArrowDownIcon width={18} height={18} />
+            {unseenCount > 0 && (
+              <span className="scroll-down-fab__badge">{unseenCount > 99 ? '99+' : unseenCount}</span>
+            )}
+          </button>
+        </div>
       </div>
       )}
 

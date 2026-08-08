@@ -1,10 +1,12 @@
 :root {
-  font: 15px/1.45 -apple-system, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font: 15px/1.45 'Inter Variable', Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   color-scheme: dark;
 }
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-tertiary) 45%, transparent) transparent;
 }
 
 html, body {
@@ -27,6 +29,8 @@ button, input {
   font-family: inherit;
 }
 
+/* Скроллбары и выделение текста идут за темой: раньше они были захардкожены
+   белым и на светлой теме превращались в невидимую полоску. */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -37,10 +41,15 @@ button, input {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: color-mix(in srgb, var(--text-tertiary) 45%, transparent);
   border-radius: 999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: color-mix(in srgb, var(--text-tertiary) 75%, transparent);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--text-primary);
 }

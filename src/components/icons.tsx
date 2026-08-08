@@ -171,6 +171,15 @@ export function BackIcon(props: IconProps) {
   )
 }
 
+export function ArrowDownIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M12 5v14" />
+      <path d="M6 13l6 6 6-6" />
+    </svg>
+  )
+}
+
 export function CheckIcon(props: IconProps) {
   return (
     <svg {...base(props)}>

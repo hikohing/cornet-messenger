@@ -123,9 +123,7 @@ export const MessageBubble = memo(function MessageBubble({
     if (isOwn && message.type === 'text') {
       items.push({ label: 'Изменить', icon: <EditIcon width={15} height={15} />, onClick: () => setEditing(true) })
     }
-    if (isOwn) {
-      items.push({ label: 'Удалить', icon: <TrashIcon width={15} height={15} />, danger: true, onClick: () => onDelete(message.id) })
-    }
+    items.push({ label: 'Удалить', icon: <TrashIcon width={15} height={15} />, danger: true, onClick: () => onDelete(message.id) })
     return items
   }
 

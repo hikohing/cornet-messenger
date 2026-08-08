@@ -294,7 +294,7 @@ export async function editMessage(messageId, userId, text) {
 
 export async function deleteMessage(messageId, userId) {
   const message = await one('SELECT * FROM messages WHERE id = $1', [messageId])
-  if (!message || message.sender_id !== userId || message.deleted) return null
+  if (!message || message.deleted) return null
   if (!(await isMember(message.chat_id, userId))) return null
   await run("UPDATE messages SET deleted = true, text = '', attachment_url = NULL, attachment_meta = NULL WHERE id = $1", [messageId])
   // Callers rebroadcast the surviving last message so chat previews stay accurate.
