@@ -27,3 +27,6 @@ desktop/release
 *.njsproj
 *.sln
 *.sw?
+
+# Нативный проект iOS генерируется Capacitor при сборке (см. .github/workflows/ios.yml)
+ios

@@ -1,0 +1,85 @@
+name: Сборка iOS (.ipa)
+
+# Собирает приложение на Mac'е GitHub и кладёт готовый .ipa в артефакты сборки.
+# Подпись здесь не делается намеренно: файл подписывает Sideloadly при установке
+# на телефон, вашим Apple ID. Поэтому сертификаты в репозиторий не нужны.
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Адрес сервера, с которым будет работать приложение'
+        required: true
+        default: 'https://web-messenger-production-3f4e.up.railway.app'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Установить зависимости
+        run: npm ci
+
+      - name: Собрать веб-часть
+        # Без этого адреса клиент пойдёт по относительным путям, а в WebView это
+        # capacitor://localhost, где никакого сервера нет.
+        env:
+          VITE_API_URL: ${{ inputs.api_url }}
+        run: npm run build
+
+      - name: Создать нативный проект
+        run: npx cap add ios
+
+      - name: Донастроить проект
+        run: bash scripts/configure-ios.sh
+
+      - name: Синхронизировать веб-часть и плагины
+        run: npx cap sync ios
+
+      - name: Собрать архив
+        # CODE_SIGNING_ALLOWED=NO — собираем неподписанным; подпись накладывает
+        # Sideloadly уже на устройстве.
+        run: |
+          if [ -d ios/App/App.xcworkspace ]; then
+            TARGET=(-workspace ios/App/App.xcworkspace)
+          else
+            TARGET=(-project ios/App/App.xcodeproj)
+          fi
+          xcodebuild "${TARGET[@]}" \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$PWD/build/App.xcarchive" \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Упаковать .ipa
+        # .ipa — это обычный zip, внутри которого папка Payload с приложением.
+        run: |
+          mkdir -p Payload
+          cp -R build/App.xcarchive/Products/Applications/App.app Payload/
+          zip -qry CorNet.ipa Payload
+          ls -lh CorNet.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CorNet-ipa
+          path: CorNet.ipa
+          retention-days: 30
+
+      - name: Логи сборки при неудаче
+        if: failure()
+        run: |
+          echo "=== структура проекта ==="
+          ls -R ios 2>/dev/null | head -60 || echo "папки ios нет"
