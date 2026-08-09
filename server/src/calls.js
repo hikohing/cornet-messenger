@@ -10,6 +10,19 @@ import { addMessage } from './chats.js'
 const RING_TIMEOUT_MS = 60_000
 /** Страховка от зависших записей, если оба клиента исчезли без close. */
 const MAX_CALL_MS = 6 * 60 * 60 * 1000
+/**
+ * Сколько ждём, пока разбуженное VoIP-пушем устройство поднимет сокет и заберёт
+ * звонок. Речь только про «ожило ли устройство» — на раздумья человека
+ * отводится общий RING_TIMEOUT_MS. Если за это время никто не отозвался, пуш
+ * не дошёл, и честнее сказать звонящему «недоступен».
+ */
+const WAKE_TIMEOUT_MS = 25_000
+/**
+ * Пока устройство просыпается, ICE-кандидаты звонящего копятся здесь. Их
+ * десятки, а не тысячи; предел — защита от клиента, который решит слать их
+ * бесконечно в звонок, который никто не заберёт.
+ */
+const MAX_BUFFERED_SIGNALS = 80
 
 const calls = new Map()
 const callsBySocket = new Map()
@@ -55,7 +68,7 @@ export function isParticipant(call, userId) {
   return Boolean(call) && !call.ended && (call.callerId === userId || call.calleeId === userId)
 }
 
-export function registerCall({ callId, chatId, callerId, calleeId, video, callerSocket, calleeSockets }) {
+export function registerCall({ callId, chatId, callerId, calleeId, video, callerSocket, calleeSockets, offer }) {
   const call = {
     id: callId,
     chatId,
@@ -70,6 +83,11 @@ export function registerCall({ callId, chatId, callerId, calleeId, video, caller
     ended: false,
     ringTimer: null,
     maxTimer: null,
+    wakeTimer: null,
+    // Оффер нужен, только пока звонок ждёт разбуженное устройство: у сокета,
+    // который был онлайн, он уже есть — его отправили вместе с приглашением.
+    offer: offer ?? null,
+    bufferedSignals: [],
   }
   calls.set(callId, call)
   trackSocket(callerSocket, callId)
@@ -81,8 +99,53 @@ export function registerCall({ callId, chatId, callerId, calleeId, video, caller
   call.maxTimer = setTimeout(() => {
     void finishCall(callId, null, 'hangup')
   }, MAX_CALL_MS)
+  if (call.ringingSockets.size === 0) {
+    call.wakeTimer = setTimeout(() => {
+      void finishCall(callId, null, 'unavailable')
+    }, WAKE_TIMEOUT_MS)
+  }
 
   return call
+}
+
+/** Ждёт ли звонок устройство, которое сейчас будят VoIP-пушем. */
+export function isAwaitingWake(call) {
+  return Boolean(call) && !call.ended && !call.answeredAt && call.ringingSockets.size === 0
+}
+
+/**
+ * Сигналинг звонящего, пока забирать его некому. Без буфера ICE-кандидаты,
+ * присланные за время пробуждения устройства, просто пропадали бы, и соединение
+ * собиралось бы дольше — а то и не собиралось вовсе.
+ */
+export function bufferSignal(call, payload) {
+  if (!call || call.ended) return
+  if (call.bufferedSignals.length >= MAX_BUFFERED_SIGNALS) return
+  call.bufferedSignals.push(payload)
+}
+
+/**
+ * Разбуженное устройство забирает звонок: его сокет становится «звонящим», а
+ * накопленный сигналинг уезжает ему одним куском.
+ *
+ * @returns {{ call: object, offer: unknown, signals: unknown[] } | null}
+ */
+export function attachCalleeSocket(callId, userId, socket) {
+  const call = calls.get(callId)
+  if (!call || call.ended || call.calleeId !== userId) return null
+  // Звонок, который уже приняли на другом устройстве, забрать нельзя.
+  if (call.answeredAt) return null
+
+  if (call.wakeTimer) {
+    clearTimeout(call.wakeTimer)
+    call.wakeTimer = null
+  }
+  call.ringingSockets.add(socket)
+  trackSocket(socket, callId)
+
+  const signals = call.bufferedSignals
+  call.bufferedSignals = []
+  return { call, offer: call.offer, signals }
 }
 
 /**
@@ -148,6 +211,7 @@ export async function finishCall(callId, byUserId, reason) {
   untrackCall(call)
   if (call.ringTimer) clearTimeout(call.ringTimer)
   if (call.maxTimer) clearTimeout(call.maxTimer)
+  if (call.wakeTimer) clearTimeout(call.wakeTimer)
 
   const targets = new Set()
   if (byUserId !== call.callerId && call.callerSocket) targets.add(call.callerSocket)

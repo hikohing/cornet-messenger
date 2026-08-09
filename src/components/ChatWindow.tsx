@@ -1,14 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { AttachmentMessageType, Chat, Message, MessageAttachment } from '../types'
 import { AvatarImage } from './AvatarImage'
 import { CallMessage } from './CallMessage'
 import { MessageBubble } from './MessageBubble'
 import { MediaLightbox } from './MediaLightbox'
 import { ForwardModal } from './ForwardModal'
+import { ReportModal } from './ReportModal'
+import { encryptFile, ENCRYPTED_UPLOAD_NAME } from '../crypto/files'
+import { isEncryptable } from '../crypto/session'
+import { PollMessage } from './PollMessage'
+import { CreatePollModal } from './CreatePollModal'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { uploadFile } from '../api/client'
 import type { ConnectionStatus } from '../api/socket'
 import { useEscapeToClose } from '../hooks/useEscapeToClose'
+import { toggleMarker, type MarkKind } from '../utils/markup'
 import { useContextMenu } from '../hooks/useContextMenu'
 import {
   ArrowDownIcon,
@@ -26,6 +32,8 @@ import {
   SmileIcon,
   SpinnerIcon,
   TrashIcon,
+  PollIcon,
+  TimerIcon,
   UsersIcon,
   VideoIcon,
 } from './icons'
@@ -33,6 +41,52 @@ import {
 const COMPOSER_EMOJIS = [
   '😀', '😂', '😍', '🥰', '😉', '😎', '🤔', '😢', '😭', '😡',
   '👍', '👎', '🙏', '👏', '🔥', '🎉', '❤️', '💯', '✅', '🤝',
+]
+
+/** Короткая подпись таймера для шапки чата. */
+function autoDeleteShortLabel(seconds: number) {
+  const days = Math.round(seconds / 86400)
+  return days >= 1 ? `${days} дн.` : `${Math.round(seconds / 3600)} ч`
+}
+
+/** Учитывает и тумблер в настройках приложения, и системную настройку ОС. */
+function prefersReducedMotion() {
+  return (
+    document.documentElement.dataset.reducedMotion === 'true' ||
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+}
+
+/** Высота автоувеличивающегося поля ввода задаётся инлайн-стилем. */
+const COMPOSER_MAX_HEIGHT = 120
+function resizeComposer(el: HTMLTextAreaElement | null) {
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT)}px`
+}
+
+/**
+ * Раскладка как в Telegram Desktop. Редкие стили намеренно живут на Ctrl+Shift:
+ * голый Ctrl+X — это «вырезать», а Ctrl+P — «печать», перехватывать их нельзя.
+ * Ключи сравниваются в нижнем регистре, потому что с Shift браузер отдаёт
+ * заглавную букву в e.key.
+ */
+const FORMAT_HOTKEYS: { key: string; shift: boolean; kind: MarkKind }[] = [
+  { key: 'b', shift: false, kind: 'bold' },
+  { key: 'i', shift: false, kind: 'italic' },
+  { key: 'u', shift: false, kind: 'underline' },
+  { key: 'x', shift: true, kind: 'strike' },
+  { key: 'm', shift: true, kind: 'code' },
+  { key: 'p', shift: true, kind: 'spoiler' },
+]
+
+const FORMAT_BUTTONS: { kind: MarkKind; label: string; hint: string }[] = [
+  { kind: 'bold', label: 'Ж', hint: 'Жирный (Ctrl+B)' },
+  { kind: 'italic', label: 'К', hint: 'Курсив (Ctrl+I)' },
+  { kind: 'underline', label: 'Ч', hint: 'Подчёркнутый (Ctrl+U)' },
+  { kind: 'strike', label: 'З', hint: 'Зачёркнутый (Ctrl+Shift+X)' },
+  { kind: 'code', label: '{ }', hint: 'Моноширинный (Ctrl+Shift+M)' },
+  { kind: 'spoiler', label: '▚', hint: 'Спойлер (Ctrl+Shift+P)' },
 ]
 
 interface ChatWindowProps {
@@ -48,8 +102,11 @@ interface ChatWindowProps {
   sendReadReceipts: boolean
   saveDrafts: boolean
   onBack: () => void
-  onSend: (text: string, attachment?: MessageAttachment, replyToId?: number) => boolean
+  onSend: (text: string, attachment?: MessageAttachment, replyToId?: number) => boolean | Promise<boolean>
   onEdit: (messageId: number, text: string) => void
+  onCreatePoll: (poll: { question: string; options: string[]; anonymous: boolean; multipleChoice: boolean }) => void
+  onVotePoll: (messageId: number, optionId: number) => void
+  onClosePoll: (messageId: number) => void
   onDelete: (messageId: number) => void
   onTyping: (chatId: number) => void
   onMarkRead: (chatId: number, messageId: number) => void
@@ -123,6 +180,9 @@ export function ChatWindow({
   onBack,
   onSend,
   onEdit,
+  onCreatePoll,
+  onVotePoll,
+  onClosePoll,
   onDelete,
   onTyping,
   onMarkRead,
@@ -138,6 +198,9 @@ export function ChatWindow({
   const [uploading, setUploading] = useState(false)
   const [replyingTo, setReplyingTo] = useState<Message | null>(null)
   const [forwardingMessages, setForwardingMessages] = useState<Message[] | null>(null)
+  // Текст берём из пузыря, а не из message.text: у зашифрованного сообщения
+  // серверный text пуст, а расшифровка живёт в компоненте.
+  const [reportingMessage, setReportingMessage] = useState<{ message: Message; text: string } | null>(null)
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<number>>(new Set())
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -172,6 +235,10 @@ export function ChatWindow({
   const cancelRecordingRef = useRef(false)
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const emojiWrapRef = useRef<HTMLDivElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  const [formatBar, setFormatBar] = useState<{ start: number; end: number } | null>(null)
+  const [creatingPoll, setCreatingPoll] = useState(false)
+  const pendingSelectionRef = useRef<[number, number] | null>(null)
   const lastTypingSentRef = useRef(0)
   const currentChatId = chat?.id ?? null
   const draftChatIdRef = useRef<number | null>(currentChatId)
@@ -195,10 +262,7 @@ export function ChatWindow({
   const scrollToBottom = useCallback((smooth = false) => {
     const el = containerRef.current
     if (!el) return
-    const reduced =
-      document.documentElement.dataset.reducedMotion === 'true' ||
-      window.matchMedia('(prefers-reduced-motion: reduce)').matches
-    el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduced ? 'smooth' : 'auto' })
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth && !prefersReducedMotion() ? 'smooth' : 'auto' })
     atBottomRef.current = true
     setUnseenCount(0)
     setShowScrollDown(false)
@@ -311,6 +375,23 @@ export function ChatWindow({
     if (currentChatId !== null && saveDrafts) localStorage.setItem(`connecto:draft:${currentChatId}`, draft)
   }, [draft, currentChatId, saveDrafts])
 
+  // Привязано к значению, а не к вводу с клавиатуры: иначе после отправки,
+  // переключения чата или вставки эмодзи поле сохраняло старую инлайн-высоту
+  // и висело растянутым на несколько строк, будучи пустым.
+  useEffect(() => {
+    resizeComposer(composerRef.current)
+  }, [draft])
+
+  useLayoutEffect(() => {
+    const pending = pendingSelectionRef.current
+    if (!pending) return
+    pendingSelectionRef.current = null
+    const el = composerRef.current
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(pending[0], pending[1])
+  })
+
   useEffect(() => {
     if (recorderRef.current?.state === 'recording') finishRecording(true)
     setReplyingTo(null)
@@ -361,12 +442,38 @@ export function ChatWindow({
     })
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!draft.trim()) return
-    if (!onSend(draft, undefined, replyingTo?.id)) return
+    const text = draft
     setDraft('')
     setReplyingTo(null)
+    if (!(await onSend(text, undefined, replyingTo?.id))) {
+      setDraft(text)
+    }
+  }
+
+  /** Панель форматирования показывается только когда в поле есть выделение. */
+  function updateFormatBar(el: HTMLTextAreaElement) {
+    if (el.selectionStart === el.selectionEnd) {
+      setFormatBar(null)
+      return
+    }
+    setFormatBar({ start: el.selectionStart, end: el.selectionEnd })
+  }
+
+  function applyMarker(kind: MarkKind) {
+    const el = composerRef.current
+    if (!el) return
+    const result = toggleMarker(draft, el.selectionStart, el.selectionEnd, kind)
+    if (result.text === draft) return
+    handleDraftChange(result.text)
+    setFormatBar({ start: result.selectionStart, end: result.selectionEnd })
+    // Записать выделение можно только после того, как React обновит value —
+    // иначе браузер сбросит курсор в конец. Делаем это в layout-эффекте, а не
+    // в requestAnimationFrame: rAF не срабатывает в фоновой вкладке, и там
+    // выделение бы терялось.
+    pendingSelectionRef.current = [result.selectionStart, result.selectionEnd]
   }
 
   function handleDraftChange(value: string) {
@@ -394,8 +501,17 @@ export function ChatWindow({
     }
     setUploading(true)
     try {
-      const res = await uploadFile(file)
-      if (!onSend('', { ...res, duration, messageType }, replyingTo?.id)) throw new Error('Нет соединения. Повторите отправку после подключения.')
+      // В зашифрованном чате на сервер уезжает шифротекст под обезличенным
+      // именем: настоящие имя, тип и ключ поедут внутри конверта сообщения.
+      const encryptable = isEncryptable(chat, currentUserId)
+      const prepared = encryptable ? await encryptFile(file) : null
+      const res = prepared
+        ? await uploadFile(prepared.blob, ENCRYPTED_UPLOAD_NAME)
+        : await uploadFile(file)
+      const attachment = prepared
+        ? { ...res, name: file.name, mimeType: file.type || 'application/octet-stream', duration, messageType, secret: prepared.secret }
+        : { ...res, duration, messageType }
+      if (!(await onSend('', attachment, replyingTo?.id))) throw new Error('Нет соединения. Повторите отправку после подключения.')
       setReplyingTo(null)
     } catch (err) {
       setUploadError((err as Error).message)
@@ -522,7 +638,7 @@ export function ChatWindow({
 
   function scrollToMessage(messageId: number) {
     const el = containerRef.current?.querySelector(`[data-message-id="${messageId}"]`)
-    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' })
     setSearchOpen(false)
   }
 
@@ -693,7 +809,15 @@ export function ChatWindow({
             {chat.type === 'direct' && other?.online && <span className="online-dot" />}
           </span>
           <span className="chat-panel__header-info">
-            <h2>{chat.name}</h2>
+            <h2>
+              {chat.name}
+              {chat.autoDeleteSeconds > 0 && (
+                <span className="chat-header__timer" title="Сообщения в этом чате исчезают по таймеру">
+                  <TimerIcon width={11} height={11} />
+                  {autoDeleteShortLabel(chat.autoDeleteSeconds)}
+                </span>
+              )}
+            </h2>
             <span className={`chat-status${typingNames.length > 0 ? ' is-typing' : ''}`}>
               {typingNames.length > 0 ? `${typingNames.join(', ')} печатает...` : statusLabel(chat, other)}
             </span>
@@ -897,9 +1021,29 @@ export function ChatWindow({
               next.senderId === message.senderId &&
               next.createdAt - message.createdAt < GROUP_WINDOW_MS
             )
+            // Проверка на deleted обязана быть раньше ветки опроса: удалённое
+            // сообщение с опросом иначе продолжало бы рисоваться как живой
+            // опрос, в котором ещё и можно голосовать.
+            if (message.type === 'poll' && message.poll && !message.deleted) {
+              return (
+                <div key={message.clientKey ?? message.id} data-message-id={message.id}>
+                  {showSeparator && <div className="date-separator">{dayLabel(message.createdAt)}</div>}
+                  <div className={`message-row${isOwn ? ' own' : ''}`}>
+                    <div className="message-bubble message-bubble--poll">
+                      <PollMessage
+                        poll={message.poll}
+                        isOwn={isOwn}
+                        onVote={(optionId) => onVotePoll(message.id, optionId)}
+                        onClose={() => onClosePoll(message.id)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )
+            }
             if (message.type === 'call') {
               return (
-                <div key={message.id} data-message-id={message.id}>
+                <div key={message.clientKey ?? message.id} data-message-id={message.id}>
                   {showSeparator && <div className="date-separator">{dayLabel(message.createdAt)}</div>}
                   <CallMessage
                     message={message}
@@ -910,7 +1054,7 @@ export function ChatWindow({
               )
             }
             return (
-              <div key={message.id} data-message-id={message.id}>
+              <div key={message.clientKey ?? message.id} data-message-id={message.id}>
                 {showSeparator && <div className="date-separator">{dayLabel(message.createdAt)}</div>}
                 <MessageBubble
                   message={message}
@@ -926,6 +1070,7 @@ export function ChatWindow({
                   onDelete={onDelete}
                   onReply={setReplyingTo}
                   onForward={(selected) => setForwardingMessages([selected])}
+                  onReport={(selected, text) => setReportingMessage({ message: selected, text })}
                   onReact={onReact}
                   onTogglePin={handleTogglePin}
                   selectionMode={selectedMessages.length > 0}
@@ -973,6 +1118,28 @@ export function ChatWindow({
 
       {uploadError && <div className="composer-error" role="alert">{uploadError}</div>}
 
+      {formatBar && !isRecording && (
+        <div className="format-bar" role="toolbar" aria-label="Форматирование текста">
+          {FORMAT_BUTTONS.map(({ kind, label, hint }) => (
+            <button
+              key={kind}
+              type="button"
+              className={`format-bar__btn format-bar__btn--${kind}`}
+              title={hint}
+              aria-label={hint}
+              // onMouseDown, а не onClick: клик сначала снял бы фокус с поля
+              // и выделение пропало бы до того, как мы его прочитаем.
+              onMouseDown={(e) => {
+                e.preventDefault()
+                applyMarker(kind)
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
       <form className="message-input" onSubmit={handleSubmit}>
         <input
           type="file"
@@ -990,6 +1157,19 @@ export function ChatWindow({
         >
           {uploading ? <SpinnerIcon width={18} height={18} /> : <AttachIcon width={18} height={18} />}
         </button>
+        {/* Опрос считает голоса на сервере, поэтому он возможен только там, где
+            переписка не зашифрована сквозным шифрованием, — то есть в группах. */}
+        {chat.type === 'group' && !isRecording && (
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => setCreatingPoll(true)}
+            disabled={connectionStatus !== 'connected'}
+            title="Создать опрос"
+          >
+            <PollIcon width={18} height={18} />
+          </button>
+        )}
         {isRecording ? (
           <>
             <div className="voice-recording" aria-live="polite">
@@ -1041,18 +1221,28 @@ export function ChatWindow({
           )}
         </div>
         <textarea
+          ref={composerRef}
           className="text-input message-composer"
           rows={1}
           placeholder="Напишите сообщение..."
           value={draft}
           maxLength={4000}
           onChange={(e) => handleDraftChange(e.target.value)}
-          onInput={(e) => {
-            e.currentTarget.style.height = 'auto'
-            e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 120)}px`
-          }}
+          onSelect={(e) => updateFormatBar(e.currentTarget)}
+          onBlur={() => setFormatBar(null)}
           onKeyDown={(e) => {
-            const shouldSend = (enterToSend && e.key === 'Enter' && !e.shiftKey) || (e.key === 'Enter' && (e.ctrlKey || e.metaKey))
+            const modifier = e.ctrlKey || e.metaKey
+            if (modifier && !e.altKey) {
+              const hotkey = FORMAT_HOTKEYS.find(
+                (h) => h.key === e.key.toLowerCase() && h.shift === e.shiftKey,
+              )
+              if (hotkey) {
+                e.preventDefault()
+                applyMarker(hotkey.kind)
+                return
+              }
+            }
+            const shouldSend = (enterToSend && e.key === 'Enter' && !e.shiftKey) || (e.key === 'Enter' && modifier)
             if (!shouldSend) return
             e.preventDefault()
             e.currentTarget.form?.requestSubmit()
@@ -1078,6 +1268,16 @@ export function ChatWindow({
         )}
       </form>
 
+      {creatingPoll && (
+        <CreatePollModal
+          onCreate={(poll) => {
+            onCreatePoll(poll)
+            setCreatingPoll(false)
+          }}
+          onClose={() => setCreatingPoll(false)}
+        />
+      )}
+
       {forwardingMessages && (
         <ForwardModal
           chats={chats}
@@ -1089,6 +1289,17 @@ export function ChatWindow({
             clearSelection()
           }}
           onClose={() => setForwardingMessages(null)}
+        />
+      )}
+
+      {reportingMessage && (
+        <ReportModal
+          targetName={
+            chat.members.find((member) => member.id === reportingMessage.message.senderId)?.username ?? 'участника'
+          }
+          messageId={reportingMessage.message.id}
+          excerpt={reportingMessage.text}
+          onClose={() => setReportingMessage(null)}
         />
       )}
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { syncStatusBarWithTheme } from '../native/shell'
 
 export type ThemePreference = 'dark' | 'amoled' | 'light' | 'system'
 export type FontSizePreference = 'small' | 'medium' | 'large'
@@ -127,6 +128,9 @@ export function usePreferences() {
 
     function applyTheme() {
       root.dataset.theme = preferences.theme === 'system' ? (media.matches ? 'light' : 'dark') : preferences.theme
+      // В нативной сборке иконки статус-бара рисует система — на светлой теме
+      // белые иконки слились бы с фоном.
+      syncStatusBarWithTheme(root.dataset.theme)
     }
 
     applyTheme()

@@ -1,23 +1,28 @@
 import { memo, useRef, useState } from 'react'
 import type { Message } from '../types'
-import { resolveUrl } from '../api/client'
 import { AvatarImage } from './AvatarImage'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { useContextMenu } from '../hooks/useContextMenu'
 import { useLongPress } from '../hooks/useLongPress'
 import { showToast } from '../hooks/useToast'
+import { renderFormattedText } from '../utils/formatting'
+import { stripFormatting } from '../utils/markup'
 import { VoiceMessage } from './VoiceMessage'
 import {
+  AlertIcon,
   CheckIcon,
   AttachIcon,
   CopyIcon,
   DoubleCheckIcon,
   EditIcon,
   ForwardIcon,
+  LockIcon,
   PinIcon,
   ReplyIcon,
+  SpinnerIcon,
   TrashIcon,
 } from './icons'
+import { useAttachmentSource } from '../hooks/useAttachmentSource'
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
 
@@ -41,6 +46,8 @@ interface MessageBubbleProps {
   onDelete: (messageId: number) => void
   onReply: (message: Message) => void
   onForward: (message: Message) => void
+  /** Второй аргумент — расшифрованный текст: у сервера его может не быть. */
+  onReport: (message: Message, text: string) => void
   onReact: (messageId: number, emoji: string) => void
   onTogglePin: (messageId: number | null) => void
   selectionMode: boolean
@@ -69,6 +76,37 @@ function attachmentLabel(message: Message) {
   return message.attachment?.name || 'Файл'
 }
 
+const DECRYPTION_ERROR_LABELS: Record<NonNullable<Message['decryptionFailed']>, string> = {
+  signature_invalid: 'Подпись отправителя недействительна',
+  key_missing: 'Нет ключа для расшифровки',
+  decrypt_failed: 'Не удалось расшифровать',
+}
+
+/**
+ * Текст цитаты в ответе. Разметка тут не рендерится — показываем чистый текст,
+ * иначе маркеры вроде ** торчали бы в превью.
+ *
+ * Отдельная ветка для зашифрованных нужна потому, что у них серверный `text`
+ * пуст: без неё пустая строка проваливалась в attachmentLabel, и ответ на
+ * обычное текстовое сообщение подписывался «Файл».
+ */
+function replyQuoteText(replyTo: Message): string {
+  if (replyTo.deleted) return 'Сообщение удалено'
+  if (replyTo.type === 'poll') return `📊 ${replyTo.poll?.question ?? 'Опрос'}`
+  const resolved = resolveMessageText(replyTo)
+  if (resolved.text) return stripFormatting(resolved.text)
+  if (replyTo.encrypted) return '🔒 Зашифрованное сообщение'
+  return attachmentLabel(replyTo)
+}
+
+/** Resolves what to show for a message body: plaintext as-is, or the decrypted/pending/failed state of an E2E-encrypted one. */
+function resolveMessageText(message: Message): { text: string; pending: boolean; failed: string | null } {
+  if (!message.encrypted) return { text: message.text, pending: false, failed: null }
+  if (message.decryptedText !== undefined) return { text: message.decryptedText, pending: false, failed: null }
+  if (message.decryptionFailed) return { text: '', pending: false, failed: DECRYPTION_ERROR_LABELS[message.decryptionFailed] }
+  return { text: '', pending: true, failed: null }
+}
+
 export const MessageBubble = memo(function MessageBubble({
   message,
   isOwn,
@@ -83,6 +121,7 @@ export const MessageBubble = memo(function MessageBubble({
   onDelete,
   onReply,
   onForward,
+  onReport,
   onReact,
   onTogglePin,
   selectionMode,
@@ -92,23 +131,28 @@ export const MessageBubble = memo(function MessageBubble({
   onSelectionDragEnter,
   onOpenImage,
 }: MessageBubbleProps) {
-  const emojiOnly = Boolean(message.text && /^(?:\p{Extended_Pictographic}|️|‍|\s){1,16}$/u.test(message.text))
+  const resolved = resolveMessageText(message)
+  const emojiOnly = Boolean(resolved.text && /^(?:\p{Extended_Pictographic}|️|‍|\s){1,16}$/u.test(resolved.text))
   const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(message.text)
+  // Seeded when edit mode opens, not at mount: the text can arrive later (async
+  // decryption) or change (a previous edit), and a mount-time seed would leave
+  // the edit box holding stale — or, for an encrypted row, empty — text.
+  const [draft, setDraft] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
   const skipNextSelectionClickRef = useRef(false)
   const { menu, openFromMouseEvent, openFromTouchEvent, close: closeMenu } = useContextMenu()
+  const media = useAttachmentSource(message)
 
   function buildMenuItems(): ContextMenuItem[] {
     const items: ContextMenuItem[] = [
       { label: 'Ответить', icon: <ReplyIcon width={15} height={15} />, onClick: () => onReply(message) },
     ]
-    if (message.text) {
+    if (resolved.text) {
       items.push({
         label: 'Копировать',
         icon: <CopyIcon width={15} height={15} />,
         onClick: () => {
-          navigator.clipboard.writeText(message.text).catch(() => {})
+          navigator.clipboard.writeText(resolved.text).catch(() => {})
           showToast('Скопировано')
         },
       })
@@ -120,8 +164,24 @@ export const MessageBubble = memo(function MessageBubble({
       icon: <PinIcon width={15} height={15} />,
       onClick: () => onTogglePin(isPinned ? null : message.id),
     })
-    if (isOwn && message.type === 'text') {
-      items.push({ label: 'Изменить', icon: <EditIcon width={15} height={15} />, onClick: () => setEditing(true) })
+    if (isOwn && message.type === 'text' && !resolved.pending) {
+      items.push({
+        label: 'Изменить',
+        icon: <EditIcon width={15} height={15} />,
+        onClick: () => {
+          setDraft(resolved.text)
+          setEditing(true)
+        },
+      })
+    }
+    // Жаловаться на себя незачем — пункт есть только у чужих сообщений.
+    if (!isOwn) {
+      items.push({
+        label: 'Пожаловаться',
+        icon: <AlertIcon width={15} height={15} />,
+        danger: true,
+        onClick: () => onReport(message, resolved.text),
+      })
     }
     items.push({ label: 'Удалить', icon: <TrashIcon width={15} height={15} />, danger: true, onClick: () => onDelete(message.id) })
     return items
@@ -146,7 +206,7 @@ export const MessageBubble = memo(function MessageBubble({
   }
 
   function handleSave() {
-    if (draft.trim() && draft.trim() !== message.text) onEdit(message.id, draft.trim())
+    if (draft.trim() && draft.trim() !== resolved.text) onEdit(message.id, draft.trim())
     setEditing(false)
   }
 
@@ -207,42 +267,76 @@ export const MessageBubble = memo(function MessageBubble({
           )}
 
           {message.replyTo && (
-            <div className="reply-quote">
-              {message.replyTo.deleted ? 'Сообщение удалено' : message.replyTo.text || attachmentLabel(message.replyTo)}
+            <div className="reply-quote">{replyQuoteText(message.replyTo)}</div>
+          )}
+
+          {/* Зашифрованное вложение: конверт ещё не открыт, поэтому неизвестны
+              ни тип, ни имя — показываем нейтральную заглушку. */}
+          {media.status === 'locked' && (
+            <div className="message-file message-file--locked">
+              <span className="message-file__icon"><LockIcon width={18} height={18} /></span>
+              <span className="message-file__info">
+                <strong>Зашифрованное вложение</strong>
+                <small>{formatFileSize(media.size)}</small>
+              </span>
             </div>
           )}
 
-          {message.type === 'image' && message.attachmentUrl && (
+          {media.type === 'image' && media.src && (
             <button
               type="button"
               className="message-media-link"
-              onClick={() => onOpenImage(message.attachmentUrl!, message.attachment?.name || 'Изображение')}
+              onClick={() => onOpenImage(media.src!, media.name)}
             >
-              <img className="message-image" src={resolveUrl(message.attachmentUrl)} alt={message.attachment?.name || 'Изображение'} loading="lazy" />
+              <img className="message-image" src={media.src} alt={media.name} loading="lazy" />
             </button>
           )}
 
-          {message.type === 'video' && message.attachmentUrl && (
-            <video className="message-video" src={resolveUrl(message.attachmentUrl)} controls preload="metadata" />
+          {media.type === 'video' && media.src && (
+            <video className="message-video" src={media.src} controls preload="metadata" />
           )}
 
-          {(message.type === 'voice' || message.type === 'audio') && message.attachmentUrl && (
+          {(media.type === 'voice' || media.type === 'audio') && media.src && (
             <VoiceMessage
-              url={message.attachmentUrl}
-              duration={message.attachment?.duration}
+              src={media.src}
+              duration={media.duration}
               messageId={message.id}
-              label={message.type === 'voice' ? 'Голосовое' : message.attachment?.name || 'Аудио'}
+              label={media.type === 'voice' ? 'Голосовое' : media.name || 'Аудио'}
             />
           )}
 
-          {message.type === 'file' && message.attachmentUrl && (
-            <a className="message-file" href={resolveUrl(message.attachmentUrl)} target="_blank" rel="noreferrer" download={message.attachment?.name}>
+          {media.type === 'file' && media.src && (
+            <a className="message-file" href={media.src} target="_blank" rel="noreferrer" download={media.name}>
               <span className="message-file__icon"><AttachIcon width={20} height={20} /></span>
               <span className="message-file__info">
-                <strong>{message.attachment?.name || 'Файл'}</strong>
-                <small>{formatFileSize(message.attachment?.size)}</small>
+                <strong>{media.name}</strong>
+                <small>{formatFileSize(media.size)}</small>
               </span>
             </a>
+          )}
+
+          {/* Видео и документы не тянем сами: 25 МБ на каждое открытие чата —
+              слишком дорого для мобильного трафика. */}
+          {media.load && !media.src && media.status !== 'error' && (
+            <button type="button" className="message-file message-file--pending" onClick={media.load} disabled={media.status === 'decrypting'}>
+              <span className="message-file__icon">
+                {media.status === 'decrypting' ? <SpinnerIcon width={18} height={18} /> : <LockIcon width={18} height={18} />}
+              </span>
+              <span className="message-file__info">
+                <strong>{media.name}</strong>
+                <small>{media.status === 'decrypting' ? 'Расшифровка…' : `${formatFileSize(media.size)} · нажмите, чтобы открыть`}</small>
+              </span>
+            </button>
+          )}
+
+          {media.status === 'error' && (
+            <div className="message-file message-file--locked">
+              <span className="message-file__icon"><AlertIcon width={18} height={18} /></span>
+              <span className="message-file__info">
+                <strong>{media.name}</strong>
+                <small>Не удалось расшифровать вложение</small>
+              </span>
+            </div>
           )}
 
           {editing ? (
@@ -261,10 +355,19 @@ export const MessageBubble = memo(function MessageBubble({
                 <CheckIcon width={16} height={16} />
               </button>
             </div>
+          ) : resolved.pending ? (
+            <div className="message-text muted">
+              <LockIcon width={13} height={13} /> Расшифровка…
+            </div>
+          ) : resolved.failed ? (
+            <div className="message-text muted">
+              <LockIcon width={13} height={13} /> {resolved.failed}
+            </div>
           ) : (
-            message.text && (
+            resolved.text && (
               <div className={`message-text${emojiOnly ? ' emoji-only' : ''}`}>
-                {message.text}
+                {message.encrypted && <LockIcon width={12} height={12} className="message-encrypted-icon" />}
+                {renderFormattedText(resolved.text)}
                 <span className="message-time message-time--float">
                   {message.editedAt && <span className="edited-label">изменено</span>}
                   {message.pending ? 'Отправка…' : formatTime(message.createdAt)}
@@ -290,7 +393,7 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           )}
 
-          {(!message.text || editing) && (
+          {((!resolved.text && !resolved.pending && !resolved.failed) || editing) && (
             <div className="message-time">
               {message.editedAt && <span className="edited-label">изменено</span>}
               {message.pending ? 'Отправка…' : formatTime(message.createdAt)}

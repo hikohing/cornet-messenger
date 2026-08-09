@@ -1,22 +1,43 @@
-import type { BlockedUser, Chat, Message, MessageAttachment, User } from '../types'
+import type { BlockedUser, Chat, ChatFolder, Message, MessageAttachment, User } from '../types'
+import { isNative } from '../native/platform'
+import { readSecure, removeSecure, writeSecure } from '../native/storage'
 
 const API_URL = import.meta.env.VITE_API_URL ?? ''
 
 const TOKEN_KEY = 'web-messenger:token'
 
 export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY)
+  return readSecure(TOKEN_KEY)
 }
 
 export function setToken(token: string) {
-  localStorage.setItem(TOKEN_KEY, token)
+  writeSecure(TOKEN_KEY, token)
 }
 
 export function clearToken() {
-  localStorage.removeItem(TOKEN_KEY)
+  removeSecure(TOKEN_KEY)
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+/**
+ * Сервер выдаёт session token в теле ответа только нативному клиенту — по этому
+ * заголовку он его и узнаёт. В браузере заголовка нет, сессия остаётся в
+ * HttpOnly-куке, недоступной для XSS.
+ */
+function clientHeaders(): Record<string, string> {
+  return isNative() ? { 'X-Client': 'native' } : {}
+}
+
+/**
+ * Забирает выданный сервером токен. В вебе его в ответе нет — там сессия
+ * приходит кукой, а любой оставшийся с прошлых версий токен надо стереть.
+ */
+function adoptSession<T extends { token?: string }>(response: T): T {
+  if (response.token) setToken(response.token)
+  else clearToken()
+  return response
+}
+
+export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
   let res: Response
   try {
@@ -25,6 +46,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
+        ...clientHeaders(),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...options.headers,
       },
@@ -43,24 +65,24 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export function register(username: string, password: string) {
-  return request<{ user: User }>('/api/auth/register', {
+  return request<{ user: User; token?: string }>('/api/auth/register', {
     method: 'POST',
     body: JSON.stringify({ username, password }),
-  })
+  }).then(adoptSession)
 }
 
 export function login(username: string, password: string) {
-  return request<{ user: User } | { twoFactorRequired: true; pendingToken: string }>('/api/auth/login', {
+  return request<{ user: User; token?: string } | { twoFactorRequired: true; pendingToken: string }>('/api/auth/login', {
     method: 'POST',
     body: JSON.stringify({ username, password }),
-  })
+  }).then((res) => ('twoFactorRequired' in res ? res : adoptSession(res)))
 }
 
 export function verifyTwoFactorLogin(pendingToken: string, code: string) {
-  return request<{ user: User }>('/api/auth/2fa/verify', {
+  return request<{ user: User; token?: string }>('/api/auth/2fa/verify', {
     method: 'POST',
     body: JSON.stringify({ pendingToken, code }),
-  })
+  }).then(adoptSession)
 }
 
 export function enrollTotp() {
@@ -152,11 +174,59 @@ export function leaveGroup(chatId: number) {
   return request<{ ok: true }>(`/api/chats/${chatId}/leave`, { method: 'POST' })
 }
 
+export function getFolders() {
+  return request<{ folders: ChatFolder[] }>('/api/folders')
+}
+
+export function createFolder(name: string, chatIds: number[]) {
+  return request<{ id: number; folders: ChatFolder[] }>('/api/folders', {
+    method: 'POST',
+    body: JSON.stringify({ name, chatIds }),
+  })
+}
+
+export function updateFolder(folderId: number, patch: { name?: string; chatIds?: number[] }) {
+  return request<{ folders: ChatFolder[] }>(`/api/folders/${folderId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+}
+
+export function deleteFolder(folderId: number) {
+  return request<{ folders: ChatFolder[] }>(`/api/folders/${folderId}`, { method: 'DELETE' })
+}
+
+export function archiveChat(chatId: number, archived: boolean) {
+  return request<{ chat: Chat }>(`/api/chats/${chatId}/archive`, {
+    method: 'PATCH',
+    body: JSON.stringify({ archived }),
+  })
+}
+
+/** `mutedUntil: null` включает уведомления обратно. */
+export function muteChat(chatId: number, mutedUntil: number | null) {
+  return request<{ chat: Chat }>(`/api/chats/${chatId}/mute`, {
+    method: 'PATCH',
+    body: JSON.stringify({ mutedUntil }),
+  })
+}
+
+/** Варианты таймера исчезающих сообщений; 0 выключает. */
+export const AUTO_DELETE_OPTIONS = [0, 24 * 60 * 60, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60] as const
+
+export function setAutoDelete(chatId: number, seconds: number) {
+  return request<{ ok: true; seconds: number }>(`/api/chats/${chatId}/auto-delete`, {
+    method: 'PATCH',
+    body: JSON.stringify({ seconds }),
+  })
+}
+
 export function changePassword(oldPassword: string, newPassword: string) {
-  return request<{ ok: true }>('/api/me/password', {
+  // Смена пароля выпускает новую сессию — старый токен сразу перестаёт работать.
+  return request<{ ok: true; token?: string }>('/api/me/password', {
     method: 'POST',
     body: JSON.stringify({ oldPassword, newPassword }),
-  })
+  }).then(adoptSession)
 }
 
 export interface SessionInfo {
@@ -204,11 +274,19 @@ export function forgotPassword(email: string) {
   })
 }
 
+/** Необратимо: удаляет аккаунт, личные чаты и всё загруженное. */
+export function deleteAccount(password: string, code?: string) {
+  return request<{ ok: true }>('/api/me', {
+    method: 'DELETE',
+    body: JSON.stringify({ password, code }),
+  })
+}
+
 export function resetPassword(token: string, newPassword: string) {
-  return request<{ user: User }>('/api/auth/reset-password', {
+  return request<{ user: User; token?: string }>('/api/auth/reset-password', {
     method: 'POST',
     body: JSON.stringify({ token, newPassword }),
-  })
+  }).then(adoptSession)
 }
 
 export function blockUser(userId: number) {
@@ -219,20 +297,44 @@ export function unblockUser(userId: number) {
   return request<{ ok: true }>(`/api/users/${userId}/unblock`, { method: 'POST' })
 }
 
+export interface ReportReason {
+  id: string
+  label: string
+}
+
+export function getReportReasons() {
+  return request<{ reasons: ReportReason[] }>('/api/reports/reasons')
+}
+
+export function submitReport(input: {
+  reason: string
+  comment?: string
+  messageId?: number
+  targetUserId?: number
+  /** Текст, снятый на устройстве: в зашифрованных чатах сервер видит только шифротекст. */
+  excerpt?: string
+}) {
+  return request<{ id: number }>('/api/reports', { method: 'POST', body: JSON.stringify(input) })
+}
+
 export function getBlockedUsers() {
   return request<{ users: BlockedUser[] }>('/api/users/blocked')
 }
 
-export async function uploadFile(file: File): Promise<Omit<MessageAttachment, 'messageType'>> {
+/**
+ * @param name имя, под которым файл уедет на сервер. У зашифрованных вложений
+ *   оно намеренно обезличено — настоящее хранится внутри конверта сообщения.
+ */
+export async function uploadFile(file: Blob, name?: string): Promise<Omit<MessageAttachment, 'messageType'>> {
   const token = getToken()
   const form = new FormData()
-  form.append('file', file)
+  form.append('file', file, name ?? (file instanceof File ? file.name : 'file'))
   let res: Response
   try {
     res = await fetch(`${API_URL}/api/upload`, {
       method: 'POST',
       credentials: 'include',
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      headers: { ...clientHeaders(), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: form,
     })
   } catch {
@@ -254,6 +356,28 @@ export function searchMessages(chatId: number, query: string) {
   return request<{ messages: Message[] }>(`/api/chats/${chatId}/search?query=${encodeURIComponent(query)}`)
 }
 
+export interface PushDeviceRegistration {
+  /** `apns_voip` — токен PushKit для звонков; он не совпадает с обычным APNs-токеном. */
+  provider: 'apns' | 'webpush' | 'apns_voip'
+  token: string
+  keys?: { p256dh: string; auth: string }
+  preview: boolean
+  directEnabled: boolean
+  groupEnabled: boolean
+}
+
+export function getPushConfig() {
+  return request<{ vapidPublicKey: string | null; apnsEnabled: boolean }>('/api/push/config')
+}
+
+export function registerPushDevice(device: PushDeviceRegistration) {
+  return request<{ ok: true }>('/api/push/devices', { method: 'POST', body: JSON.stringify(device) })
+}
+
+export function unregisterPushDevice(provider: 'apns' | 'webpush' | 'apns_voip', token: string) {
+  return request<{ ok: true }>('/api/push/devices', { method: 'DELETE', body: JSON.stringify({ provider, token }) })
+}
+
 export function getIceServers() {
   return request<{ iceServers: RTCIceServer[] }>('/api/ice-servers')
 }
@@ -262,6 +386,35 @@ export function apiUrl() {
   return API_URL
 }
 
+/**
+ * Билет на чтение /uploads для нативной сборки: `<img src>` не умеет слать
+ * Authorization, а куки домена API из WebView со схемы capacitor:// не уходят.
+ * В браузере не используется — там загрузки авторизуются кукой как обычно.
+ */
+let mediaTicket: { value: string; expiresAt: number } | null = null
+
+export async function ensureMediaTicket(): Promise<void> {
+  if (!isNative()) return
+  // Обновляем заранее: билет живёт полсуток, и менять его чаще нет смысла —
+  // новый билет меняет URL и обнуляет кэш всех уже загруженных картинок.
+  if (mediaTicket && mediaTicket.expiresAt - Date.now() > 60 * 60 * 1000) return
+  try {
+    const res = await request<{ ticket: string; expiresAt: number }>('/api/media-ticket')
+    mediaTicket = { value: res.ticket, expiresAt: res.expiresAt }
+  } catch {
+    // Останемся без билета — картинки не откроются, но всё остальное работает.
+  }
+}
+
+export function clearMediaTicket() {
+  mediaTicket = null
+}
+
 export function resolveUrl(url: string) {
-  return url.startsWith('http') ? url : `${API_URL}${url}`
+  // Расшифрованное вложение приходит сюда как blob:-ссылка — к ней ничего
+  // приписывать нельзя, иначе получится битый адрес.
+  if (url.startsWith('blob:') || url.startsWith('data:')) return url
+  const absolute = url.startsWith('http') ? url : `${API_URL}${url}`
+  if (!mediaTicket || !absolute.includes('/uploads/')) return absolute
+  return `${absolute}${absolute.includes('?') ? '&' : '?'}t=${encodeURIComponent(mediaTicket.value)}`
 }

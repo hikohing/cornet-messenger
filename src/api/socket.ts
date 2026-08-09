@@ -1,5 +1,5 @@
-import type { Chat, Message, MessageAttachment } from '../types'
-import { apiUrl } from './client'
+import type { Chat, Message, MessageAttachment, MessageEncryptionData } from '../types'
+import { apiUrl, getToken } from './client'
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
 
@@ -10,6 +10,7 @@ export type SocketEvent =
   | { type: 'message'; message: Message }
   | { type: 'message_edited'; message: Message }
   | { type: 'message_deleted'; chatId: number; messageId: number; lastMessage: Message | null }
+  | { type: 'messages_expired'; chatId: number; messageIds: number[] }
   | { type: 'presence'; userId: number; online: boolean }
   | { type: 'typing'; chatId: number; userId: number }
   | { type: 'read'; chatId: number; userId: number; messageId: number }
@@ -48,7 +49,10 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
   function connect() {
     if (manuallyClosed) return
     onStatus(reconnectAttempt === 0 ? 'connecting' : 'reconnecting')
-    socket = new WebSocket(wsUrl)
+    // Заголовок Authorization браузерному WebSocket задать нельзя, а куки в
+    // нативной сборке на домен API не уходят — там сессию передаём subprotocol'ом.
+    const token = getToken()
+    socket = token ? new WebSocket(wsUrl, ['bearer', token]) : new WebSocket(wsUrl)
 
     socket.addEventListener('open', () => {
       reconnectAttempt = 0
@@ -82,14 +86,40 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
     return true
   }
 
+  /**
+   * Возврат приложения из фона. iOS усыпляет процесс, и соединение к этому
+   * моменту почти наверняка порвано, а таймер переподключения ждёт до десяти
+   * секунд — всё это время сообщения не приходят. Событие присылает
+   * native/shell.ts сразу, как приложение проснулось.
+   */
+  function handleAppResume(event: Event) {
+    if (!(event as CustomEvent<{ isActive: boolean }>).detail?.isActive) return
+    if (manuallyClosed) return
+    if (socket && socket.readyState !== WebSocket.CLOSED) return
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    reconnectAttempt = 0
+    connect()
+  }
+
+  document.addEventListener('native:appstate', handleAppResume)
+
   connect()
 
   return {
-    sendMessage: (chatId: number, text: string, attachment?: MessageAttachment, replyToId?: number) =>
+    sendMessage: (
+      chatId: number,
+      text: string,
+      attachment?: MessageAttachment,
+      replyToId?: number,
+      encrypted?: MessageEncryptionData,
+    ) =>
       send({
         type: 'send',
         chatId,
-        text,
+        text: encrypted ? '' : text,
         attachmentUrl: attachment?.url,
         attachment: attachment ? {
           name: attachment.name,
@@ -99,8 +129,14 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
         } : undefined,
         messageType: attachment?.messageType,
         replyToId,
+        encrypted,
       }),
-    editMessage: (messageId: number, text: string) => send({ type: 'edit', messageId, text }),
+    editMessage: (messageId: number, text: string, encrypted?: MessageEncryptionData) =>
+      send({ type: 'edit', messageId, text: encrypted ? '' : text, encrypted }),
+    createPoll: (chatId: number, poll: { question: string; options: string[]; anonymous: boolean; multipleChoice: boolean }) =>
+      send({ type: 'poll_create', chatId, poll }),
+    votePoll: (messageId: number, optionId: number) => send({ type: 'poll_vote', messageId, optionId }),
+    closePoll: (messageId: number) => send({ type: 'poll_close', messageId }),
     deleteMessage: (messageId: number) => send({ type: 'delete', messageId }),
     sendTyping: (chatId: number) => send({ type: 'typing', chatId }),
     sendRead: (chatId: number, messageId: number) => send({ type: 'read', chatId, messageId }),
@@ -110,6 +146,8 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
     callInvite: (targetUserId: number, chatId: number, callId: string, video: boolean, sdp: RTCSessionDescriptionInit) =>
       send({ type: 'call_invite', targetUserId, chatId, callId, video, sdp }),
     callAnswer: (callId: string, sdp: RTCSessionDescriptionInit) => send({ type: 'call_answer', callId, sdp }),
+    /** Разбуженное VoIP-пушем устройство забирает у сервера отложенное приглашение. */
+    callClaim: (callId: string) => send({ type: 'call_claim', callId }),
     callIce: (callId: string, candidate: RTCIceCandidateInit) => send({ type: 'call_ice', callId, candidate }),
     callRinging: (callId: string) => send({ type: 'call_ringing', callId }),
     callNegotiate: (callId: string, sdp: RTCSessionDescriptionInit) => send({ type: 'call_negotiate', callId, sdp }),
@@ -117,6 +155,7 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
     callEnd: (callId: string, reason: string) => send({ type: 'call_end', callId, reason }),
     close() {
       manuallyClosed = true
+      document.removeEventListener('native:appstate', handleAppResume)
       if (reconnectTimer) clearTimeout(reconnectTimer)
       socket?.close()
       socket = null

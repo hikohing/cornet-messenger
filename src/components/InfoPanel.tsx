@@ -1,9 +1,10 @@
 import { useRef, useState } from 'react'
 import type { Chat, User } from '../types'
-import { uploadFile } from '../api/client'
+import { uploadFile, setAutoDelete as apiSetAutoDelete, AUTO_DELETE_OPTIONS } from '../api/client'
 import { AvatarImage } from './AvatarImage'
 import { AvatarLightbox } from './AvatarLightbox'
-import { BackIcon, BlockIcon, BookmarkIcon, CakeIcon, CameraIcon, CalendarIcon, CloseIcon, LogoutIcon, MessageIcon, PinIcon, UsersIcon } from './icons'
+import { AlertIcon, BackIcon, BlockIcon, BookmarkIcon, CakeIcon, CameraIcon, CalendarIcon, CloseIcon, LogoutIcon, MessageIcon, PinIcon, UsersIcon } from './icons'
+import { ReportModal } from './ReportModal'
 import { showToast } from '../hooks/useToast'
 import { useEscapeToClose } from '../hooks/useEscapeToClose'
 import { profileBannerStyle, profileCardColorStyle } from '../utils/profile'
@@ -22,6 +23,14 @@ interface InfoPanelProps {
   onUnblockUser: (userId: number) => Promise<void>
 }
 
+function autoDeleteLabel(seconds: number) {
+  if (seconds === 0) return 'Выкл.'
+  if (seconds === 24 * 60 * 60) return '24 часа'
+  if (seconds === 7 * 24 * 60 * 60) return '7 дней'
+  if (seconds === 30 * 24 * 60 * 60) return '30 дней'
+  return `${Math.round(seconds / 3600)} ч`
+}
+
 function formatLastSeen(timestamp: number) {
   return new Date(timestamp).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 }
@@ -36,11 +45,13 @@ function formatMemberSince(timestamp: number) {
   return new Date(timestamp).toLocaleDateString([], { day: 'numeric', month: 'long', year: 'numeric' })
 }
 
-function ProfileCard({ user, onOpenAvatar, blocked, onToggleBlock }: {
+function ProfileCard({ user, onOpenAvatar, blocked, onToggleBlock, onReport }: {
   user: User
   onOpenAvatar: () => void
   blocked: boolean
   onToggleBlock: () => void
+  /** Нет у собственной карточки — жаловаться на себя незачем. */
+  onReport?: () => void
 }) {
   const presence = user.online
     ? 'в сети'
@@ -98,24 +109,31 @@ function ProfileCard({ user, onOpenAvatar, blocked, onToggleBlock }: {
           </section>
         )}
 
-        <section className="profile-card__section">
+        <section className="profile-card__section profile-card__section--actions">
           <button className={`profile-card__block-button${blocked ? ' is-blocked' : ''}`} onClick={onToggleBlock}>
             <BlockIcon width={14} height={14} />
             {blocked ? 'Разблокировать' : 'Заблокировать'}
           </button>
+          {onReport && (
+            <button className="profile-card__block-button" onClick={onReport}>
+              <AlertIcon width={14} height={14} />
+              Пожаловаться
+            </button>
+          )}
         </section>
       </div>
     </div>
   )
 }
 
-function ProfileView({ user, onBack, onMessage, onOpenAvatar, blocked, onToggleBlock }: {
+function ProfileView({ user, onBack, onMessage, onOpenAvatar, blocked, onToggleBlock, onReport }: {
   user: User
   onBack: () => void
   onMessage: () => void
   onOpenAvatar: () => void
   blocked: boolean
   onToggleBlock: () => void
+  onReport?: () => void
 }) {
   return (
     <>
@@ -127,7 +145,7 @@ function ProfileView({ user, onBack, onMessage, onOpenAvatar, blocked, onToggleB
         <span />
       </header>
       <div className="info-panel__body info-panel__body--profile">
-        <ProfileCard user={user} onOpenAvatar={onOpenAvatar} blocked={blocked} onToggleBlock={onToggleBlock} />
+        <ProfileCard user={user} onOpenAvatar={onOpenAvatar} blocked={blocked} onToggleBlock={onToggleBlock} onReport={onReport} />
         {!blocked && (
           <button className="info-panel__message-button" onClick={onMessage}>
             <MessageIcon width={16} height={16} /> Написать сообщение
@@ -146,6 +164,9 @@ export function InfoPanel({ chat, currentUserId, blockedUserIds, onClose, onScro
   const [confirmingLeave, setConfirmingLeave] = useState(false)
   const [leaving, setLeaving] = useState(false)
   const [avatarPreviewUser, setAvatarPreviewUser] = useState<User | null>(null)
+  const [reportingUser, setReportingUser] = useState<User | null>(null)
+  const [savingAutoDelete, setSavingAutoDelete] = useState(false)
+  const [autoDeleteError, setAutoDeleteError] = useState('')
   const avatarInputRef = useRef<HTMLInputElement>(null)
   const other = chat.members.find((m) => m.id !== currentUserId)
   const headerColor = chat.type === 'group' ? '#3a3a44' : chat.type === 'saved' ? '#4a4a56' : other?.color
@@ -165,8 +186,16 @@ export function InfoPanel({ chat, currentUserId, blockedUserIds, onClose, onScro
           onOpenAvatar={() => setAvatarPreviewUser(viewingMember)}
           blocked={blockedUserIds.has(viewingMember.id)}
           onToggleBlock={() => toggleBlock(viewingMember.id)}
+          onReport={viewingMember.id === currentUserId ? undefined : () => setReportingUser(viewingMember)}
         />
         {avatarPreviewUser?.avatarUrl && <AvatarLightbox url={avatarPreviewUser.avatarUrl} name={avatarPreviewUser.displayName || avatarPreviewUser.username} onClose={() => setAvatarPreviewUser(null)} />}
+        {reportingUser && (
+          <ReportModal
+            targetName={reportingUser.displayName || reportingUser.username}
+            targetUserId={reportingUser.id}
+            onClose={() => setReportingUser(null)}
+          />
+        )}
       </aside>
     )
   }
@@ -207,6 +236,20 @@ export function InfoPanel({ chat, currentUserId, blockedUserIds, onClose, onScro
     }
   }
 
+  async function handleAutoDelete(seconds: number) {
+    if (seconds === chat.autoDeleteSeconds) return
+    setSavingAutoDelete(true)
+    setAutoDeleteError('')
+    try {
+      await apiSetAutoDelete(chat.id, seconds)
+      showToast(seconds === 0 ? 'Таймер выключен' : `Сообщения будут исчезать через ${autoDeleteLabel(seconds)}`)
+    } catch (err) {
+      setAutoDeleteError((err as Error).message)
+    } finally {
+      setSavingAutoDelete(false)
+    }
+  }
+
   return (
     <aside className="info-panel">
       <header className="info-panel__header">
@@ -223,6 +266,7 @@ export function InfoPanel({ chat, currentUserId, blockedUserIds, onClose, onScro
             onOpenAvatar={() => setAvatarPreviewUser(other)}
             blocked={blockedUserIds.has(other.id)}
             onToggleBlock={() => toggleBlock(other.id)}
+            onReport={() => setReportingUser(other)}
           />
         ) : (
           <div className="info-panel__profile">
@@ -289,6 +333,31 @@ export function InfoPanel({ chat, currentUserId, blockedUserIds, onClose, onScro
                 {chat.description?.trim() ? chat.description : 'Добавьте описание группы'}
               </button>
             )}
+          </section>
+        )}
+
+        {chat.type !== 'saved' && (
+          <section className="info-panel__section">
+            <h5>Исчезающие сообщения</h5>
+            <p className="info-panel__hint">
+              Новые сообщения будут удаляться у всех участников и на сервере по истечении срока.
+            </p>
+            <div className="auto-delete-options" role="radiogroup" aria-label="Таймер исчезающих сообщений">
+              {AUTO_DELETE_OPTIONS.map((seconds) => (
+                <button
+                  key={seconds}
+                  type="button"
+                  role="radio"
+                  aria-checked={chat.autoDeleteSeconds === seconds}
+                  className={`auto-delete-option${chat.autoDeleteSeconds === seconds ? ' is-active' : ''}`}
+                  disabled={savingAutoDelete}
+                  onClick={() => void handleAutoDelete(seconds)}
+                >
+                  {autoDeleteLabel(seconds)}
+                </button>
+              ))}
+            </div>
+            {autoDeleteError && <p className="info-panel__error">{autoDeleteError}</p>}
           </section>
         )}
 
@@ -364,6 +433,13 @@ export function InfoPanel({ chat, currentUserId, blockedUserIds, onClose, onScro
           </section>
         )}
         {avatarPreviewUser?.avatarUrl && <AvatarLightbox url={avatarPreviewUser.avatarUrl} name={avatarPreviewUser.displayName || avatarPreviewUser.username} onClose={() => setAvatarPreviewUser(null)} />}
+        {reportingUser && (
+          <ReportModal
+            targetName={reportingUser.displayName || reportingUser.username}
+            targetUserId={reportingUser.id}
+            onClose={() => setReportingUser(null)}
+          />
+        )}
       </div>
     </aside>
   )

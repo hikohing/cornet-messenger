@@ -10,15 +10,28 @@
     "preview": "vite preview",
     "postinstall": "cd server && npm install",
     "start": "node server/src/index.js",
-    "test": "node --test server/test/critical-path.test.js"
+    "test": "node --test test/markup.test.ts test/crypto-keys.test.ts server/test/critical-path.test.js server/test/push.test.js server/test/calls-wake.test.js server/test/callkit.test.js server/test/account-deletion.test.js server/test/reports.test.js",
+    "test:unit": "node --test test/markup.test.ts test/crypto-keys.test.ts",
+    "ios:add": "cap add ios",
+    "ios:sync": "npm run build && cap sync ios",
+    "ios:open": "cap open ios"
   },
   "dependencies": {
+    "@aparajita/capacitor-secure-storage": "^8.0.0",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/keyboard": "^8.0.5",
+    "@capacitor/push-notifications": "^8.1.2",
+    "@capacitor/status-bar": "^8.0.3",
     "@fontsource-variable/inter": "^5.3.0",
+    "cornet-callkit": "file:native-plugins/callkit",
     "qrcode": "^1.5.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.5.0",
+    "@capacitor/ios": "^8.5.0",
     "@types/node": "^24.13.3",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19.2.17",

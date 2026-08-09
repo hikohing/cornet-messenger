@@ -25,6 +25,67 @@ export function SearchIcon(props: IconProps) {
   )
 }
 
+export function ArchiveIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <rect x="3" y="4" width="18" height="4" rx="1" />
+      <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4" />
+    </svg>
+  )
+}
+
+export function BellIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 8-3 8h18s-3-1-3-8" />
+      <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+    </svg>
+  )
+}
+
+export function BellOffIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M13.7 21a2 2 0 0 1-3.4 0M18.6 13A17 17 0 0 1 18 8a6 6 0 0 0-9.3-5" />
+      <path d="M6.3 6.3A6 6 0 0 0 6 8c0 7-3 8-3 8h14M2 2l20 20" />
+    </svg>
+  )
+}
+
+export function FolderIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </svg>
+  )
+}
+
+export function PollIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M6 20V10M12 20V4M18 20v-7" />
+    </svg>
+  )
+}
+
+export function TimerIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <circle cx="12" cy="13" r="8" />
+      <path d="M12 9v4l2.5 2M9 2h6" />
+    </svg>
+  )
+}
+
+export function LockIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </svg>
+  )
+}
+
 export function PlusIcon(props: IconProps) {
   return (
     <svg {...base(props)}>

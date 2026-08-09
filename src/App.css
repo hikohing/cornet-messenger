@@ -119,12 +119,30 @@
   --space-6: 20px;
 }
 
+/* `animation-iteration-count` обязателен: без него бесконечная анимация
+   (спиннер, пульс, волна голосового) не останавливается, а прокручивает
+   итерацию каждые 0.01 мс — постоянный перерасчёт стилей и разряд батареи
+   вместо «выключено». */
 :root[data-reduced-motion='true'] *,
 :root[data-reduced-motion='true'] *::before,
 :root[data-reduced-motion='true'] *::after {
   scroll-behavior: auto !important;
   animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
   transition-duration: 0.01ms !important;
+}
+
+/* Системная настройка ОС должна работать сама по себе, без включения тумблера
+   в настройках приложения. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* =========================================================
@@ -196,9 +214,17 @@
   flex-shrink: 0;
 }
 
-.icon-btn:hover {
+.icon-btn:hover:not(:disabled) {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+/* Без этого выключенная кнопка (скрепка во время загрузки, микрофон без
+   соединения) выглядела полностью кликабельной: подсвечивалась под курсором
+   и показывала pointer, хотя нажатие ничего не делало. */
+.icon-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .icon-btn.is-active {
@@ -1767,6 +1793,496 @@
 .message-text.muted {
   color: var(--text-tertiary);
   font-style: italic;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.message-encrypted-icon {
+  display: inline-block;
+  vertical-align: -1px;
+  margin-right: 4px;
+  opacity: 0.55;
+}
+
+/* --------------------------------------------- разметка внутри сообщений */
+
+.message-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+
+.message-link:hover {
+  opacity: 0.8;
+}
+
+.message-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+}
+
+.message-code-block {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82em;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin: 4px 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.message-code-block code {
+  font: inherit;
+}
+
+/* Спойлер: буквы скрываются через -webkit-text-fill-color, а НЕ через
+   `color: transparent`. Иначе currentColor у самого элемента становится
+   прозрачным, и построенный на нём фон-плашка тоже исчезает — вместо блока
+   получалось пустое место, и было не видно, что текст вообще скрыт.
+   Размытие оставлено вторым слоем защиты на случай, если text-fill не
+   поддержан. */
+.message-spoiler {
+  border: none;
+  padding: 0 3px;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  -webkit-text-fill-color: transparent;
+  background: color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 3px;
+  cursor: pointer;
+  filter: blur(4px);
+  transition: filter 0.18s var(--ease), -webkit-text-fill-color 0.18s var(--ease), background 0.18s var(--ease);
+  user-select: none;
+}
+
+.message-spoiler.is-revealed {
+  -webkit-text-fill-color: currentColor;
+  background: transparent;
+  filter: none;
+  cursor: text;
+  user-select: text;
+}
+
+/* --------------------------------------------- панель форматирования */
+
+.format-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  margin: 0 var(--space-4);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-modal);
+  width: fit-content;
+  animation: pop-in 0.12s var(--ease);
+}
+
+.format-bar__btn {
+  min-width: 30px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0 7px;
+  transition: background 0.12s var(--ease), color 0.12s var(--ease);
+}
+
+.format-bar__btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.format-bar__btn--bold { font-weight: 700; }
+.format-bar__btn--italic { font-style: italic; }
+.format-bar__btn--underline { text-decoration: underline; }
+.format-bar__btn--strike { text-decoration: line-through; }
+.format-bar__btn--code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem; }
+
+/* --------------------------------------------- исчезающие сообщения */
+
+.auto-delete-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--space-2);
+}
+
+.auto-delete-option {
+  flex: 1 1 auto;
+  min-width: 68px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.12s var(--ease), border-color 0.12s var(--ease), color 0.12s var(--ease);
+}
+
+.auto-delete-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.auto-delete-option.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.auto-delete-option:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.info-panel__hint {
+  margin: 4px 0 0;
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+.info-panel__error {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--danger);
+}
+
+/* --------------------------------------------- папки и архив */
+
+.folder-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 var(--space-4) var(--space-2);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.folder-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.folder-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 0.78rem;
+  padding: 5px 10px;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s var(--ease), color 0.12s var(--ease);
+}
+
+.folder-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.folder-tab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.folder-tab__badge {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-radius: var(--radius-full);
+  font-size: 0.65rem;
+  min-width: 16px;
+  padding: 0 5px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.folder-tab--manage {
+  margin-left: auto;
+  padding: 5px 8px;
+}
+
+.folders-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.folders-modal__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.folders-modal__list li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.folders-modal__item {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.folders-modal__item.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.folders-modal__item small {
+  color: var(--text-tertiary);
+}
+
+.folders-modal__chats {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.folders-modal__chat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+
+.folders-modal__chat:hover {
+  background: var(--bg-hover);
+}
+
+.folders-modal__actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
+/* Иконка «беззвучно» в строке чата. */
+.chat-muted-icon {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+/* --------------------------------------------- опросы */
+
+.message-bubble--poll {
+  min-width: 260px;
+  max-width: 340px;
+}
+
+.poll__header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: var(--space-3);
+}
+
+.poll__question {
+  font-size: 0.92rem;
+  line-height: 1.35;
+}
+
+.poll__meta {
+  font-size: 0.72rem;
+  opacity: 0.7;
+}
+
+.poll__options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.poll__option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  padding: 3px 0;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.poll__option:disabled {
+  cursor: default;
+}
+
+.poll__option:hover:not(:disabled) .poll__marker {
+  border-color: currentColor;
+}
+
+.poll__marker {
+  flex-shrink: 0;
+  width: 17px;
+  height: 17px;
+  border-radius: var(--radius-full);
+  border: 1.5px solid color-mix(in srgb, currentColor 45%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+
+.poll__marker--box {
+  border-radius: 4px;
+}
+
+.poll__option.is-chosen .poll__marker {
+  background: currentColor;
+  border-color: currentColor;
+}
+
+/* Галочка внутри залитого маркера — инвертируем, иначе она сливается с фоном. */
+.poll__option.is-chosen .poll__marker svg {
+  color: var(--bg-elevated);
+}
+
+.poll__option-text {
+  flex: 1;
+  word-break: break-word;
+}
+
+.poll__percent {
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+
+.poll__bar {
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, currentColor 16%, transparent);
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.poll__bar-fill {
+  height: 100%;
+  background: currentColor;
+  opacity: 0.75;
+  border-radius: var(--radius-full);
+  transition: width 0.3s var(--ease);
+}
+
+.poll__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  font-size: 0.74rem;
+  opacity: 0.75;
+}
+
+.poll__close-button {
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0.9;
+}
+
+.poll-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+}
+
+.poll-form__option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.poll-form__option .text-input {
+  flex: 1;
+}
+
+.poll-form__add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  border: none;
+  background: none;
+  color: var(--accent-hover);
+  font-size: 0.82rem;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.poll-form__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+/* Значок таймера в шапке чата — чтобы режим был виден без открытия панели. */
+.chat-header__timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  border-radius: var(--radius-full);
+  padding: 2px 8px;
+  margin-left: 6px;
+  white-space: nowrap;
 }
 
 .message-time {
@@ -7803,4 +8319,283 @@
     min-height: 44px;
     border-radius: 13px;
   }
+}
+
+/* =========================================================
+   Нативная сборка (iOS)
+   =========================================================
+   Всё в этом блоке включается только под data-platform="ios",
+   который выставляет src/native/shell.ts. В браузере ничего
+   из этого не применяется.
+   ========================================================= */
+
+[data-platform='ios'] {
+  /* Пока клавиатура закрыта, отступ нулевой; shell.ts подставляет высоту. */
+  --keyboard-height: 0px;
+}
+
+/* Оттяжка страницы за края (rubber band) в приложении выглядит поломкой:
+   под лентой сообщений видно пустой фон окна. */
+[data-platform='ios'] body {
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+}
+
+/* Долгий тап по сообщению открывает наше контекстное меню — системная лупа и
+   всплывашка Safari поверх него только мешают. */
+[data-platform='ios'] .app-shell {
+  -webkit-touch-callout: none;
+}
+
+/* Чёлка и «домашняя» полоска: интерфейс не должен под них уезжать. */
+[data-platform='ios'] .left-rail,
+[data-platform='ios'] .sidebar__header,
+[data-platform='ios'] .chat-panel__header {
+  padding-top: calc(var(--space-3) + env(safe-area-inset-top));
+}
+
+[data-platform='ios'] .left-rail {
+  padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+}
+
+/* Поле ввода прижато к низу экрана: над домашней полоской, а когда открыта
+   клавиатура — прямо над ней. */
+[data-platform='ios'] .message-input {
+  padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+}
+
+[data-platform='ios'][data-keyboard='open'] .message-input {
+  padding-bottom: var(--space-3);
+}
+
+/* Список чатов и лента сообщений должны докручиваться до конца, а не прятать
+   последние строки за домашней полоской. */
+[data-platform='ios'] .chat-list-scroll,
+[data-platform='ios'] .message-list {
+  scroll-padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* =========================================================
+   Удаление аккаунта
+   ========================================================= */
+
+/* Единственное необратимое действие в настройках — оно и должно выглядеть
+   иначе, чем всё остальное, а не как ещё одна строчка в списке. */
+.settings-card--danger .settings-card-title h3 {
+  color: var(--danger);
+}
+
+.settings-danger-list {
+  margin: 0 0 var(--space-4);
+  padding-left: 1.15em;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.settings-danger-list strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.settings-danger-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.settings-button--danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* =========================================================
+   Жалобы на контент
+   ========================================================= */
+
+.report-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+}
+
+.report-reasons {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.report-reason {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 9px var(--space-2);
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 0.86rem;
+}
+
+.report-reason:hover {
+  background: var(--bg-hover);
+}
+
+.report-comment {
+  resize: vertical;
+  min-height: 64px;
+  font-family: inherit;
+}
+
+/* Цитата отправляемого текста: человек должен видеть, что именно уходит
+   оператору, — особенно в зашифрованном чате, где сервер сам её не прочтёт. */
+.report-excerpt {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  background: var(--bg-hover);
+  border-radius: 0 8px 8px 0;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.profile-card__section--actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* =========================================================
+   Политика конфиденциальности
+   ========================================================= */
+
+.privacy-page {
+  min-height: 100dvh;
+  overflow-y: auto;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  padding: var(--space-6) var(--space-4);
+  padding-top: calc(var(--space-6) + env(safe-area-inset-top));
+  padding-bottom: calc(var(--space-6) + env(safe-area-inset-bottom));
+}
+
+.privacy-sheet {
+  max-width: 720px;
+  margin: 0 auto;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.privacy-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+.privacy-sheet h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.privacy-sheet h2 {
+  margin: var(--space-6) 0 var(--space-2);
+  font-size: 1.02rem;
+}
+
+.privacy-sheet p,
+.privacy-sheet ul {
+  margin: 0 0 var(--space-3);
+  color: var(--text-secondary);
+}
+
+.privacy-sheet ul {
+  padding-left: 1.2em;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.privacy-sheet strong {
+  color: var(--text-primary);
+}
+
+.privacy-updated {
+  margin-top: 4px;
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+}
+
+/* Оговорка, которую нельзя пролистать взглядом: вложения сквозным шифрованием
+   не защищены, и человек должен это увидеть. */
+.privacy-note {
+  padding: var(--space-3);
+  border-left: 3px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border-radius: 0 10px 10px 0;
+}
+
+/* Незаполненные поля оператора видно сразу — лучше пустое место, чем выдуманное
+   название компании в юридическом документе. */
+.privacy-placeholder {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+  color: var(--text-primary);
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 0.85em;
+}
+
+.auth-privacy-link {
+  align-self: center;
+  background: none;
+  border: 0;
+  padding: var(--space-2);
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.auth-privacy-link:hover {
+  color: var(--text-secondary);
+}
+
+/* =========================================================
+   Зашифрованные вложения
+   ========================================================= */
+
+/* Конверт ещё не открыт или файл ждёт нажатия — карточка выглядит как обычное
+   вложение, но без содержимого, которого мы пока честно не знаем. */
+.message-file--locked,
+.message-file--pending {
+  width: 100%;
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+
+.message-file--pending {
+  cursor: pointer;
+}
+
+.message-file--pending:hover:not(:disabled) {
+  border-style: solid;
+  border-color: var(--accent);
+}
+
+.message-file--pending:disabled {
+  cursor: default;
+  opacity: 0.75;
 }

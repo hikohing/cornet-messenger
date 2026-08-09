@@ -13,9 +13,11 @@ export function useAuth() {
     let active = true
     api
       .getMe()
-      .then((res) => {
+      // Билет на медиа нужен до первого рендера: иначе аватары и картинки
+      // успеют отрисоваться со ссылками без него и получат 401.
+      .then(async (res) => {
+        await api.ensureMediaTicket()
         if (!active) return
-        api.clearToken()
         setUser(res.user)
         setTokenState('cookie-session')
       })
@@ -38,7 +40,7 @@ export function useAuth() {
         setPendingTwoFactorToken(res.pendingToken)
         return
       }
-      api.clearToken()
+      await api.ensureMediaTicket()
       setTokenState('cookie-session')
       setUser(res.user)
     } catch (err) {
@@ -52,7 +54,7 @@ export function useAuth() {
     setError(null)
     try {
       const res = await api.verifyTwoFactorLogin(pendingTwoFactorToken, code)
-      api.clearToken()
+      await api.ensureMediaTicket()
       setTokenState('cookie-session')
       setUser(res.user)
       setPendingTwoFactorToken(null)
@@ -71,7 +73,7 @@ export function useAuth() {
     setError(null)
     try {
       const res = await api.register(username, password)
-      api.clearToken()
+      await api.ensureMediaTicket()
       setTokenState('cookie-session')
       setUser(res.user)
     } catch (err) {
@@ -83,6 +85,7 @@ export function useAuth() {
   function logout() {
     void api.logout().catch(() => undefined)
     api.clearToken()
+    api.clearMediaTicket()
     setTokenState(null)
     setUser(null)
   }

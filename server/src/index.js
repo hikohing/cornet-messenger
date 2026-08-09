@@ -27,6 +27,7 @@ import {
   enrollTotp,
   confirmTotp,
   disableTotp,
+  deleteAccount,
 } from './auth.js'
 import {
   getOrCreateDirectChat,
@@ -40,13 +41,24 @@ import {
   updateChatInfo,
   leaveGroup,
   chatIdsForUser,
+  membersOf,
+  getChatForViewer,
 } from './chats.js'
-import { attachWebSocket, isOnline, notifyChatCreated, notifyChatUpdated, notifyChatLeft, disconnectSession, disconnectSessionByHash, disconnectUser } from './ws.js'
+import { storePublicKeys, getPublicKeyBundles } from './crypto.js'
+import { setAutoDelete, startAutoDeleteSweeper, AUTO_DELETE_OPTIONS } from './autoDelete.js'
+import { listFolders, createFolder, renameFolder, deleteFolder, setFolderChats, setArchived, setMuted } from './folders.js'
+import { attachWebSocket, isOnline, notifyChatCreated, notifyChatUpdated, notifyChatLeft, notifyMessagesExpired, disconnectSession, disconnectSessionByHash, disconnectUser } from './ws.js'
 import { appError, publicErrorMessage } from './errors.js'
 import { buildIceServers } from './ice.js'
 import { audit } from './audit.js'
 import { sendSecurityAlert } from './mailer.js'
 import { blockUser, unblockUser, listBlockedByUser } from './blocking.js'
+import { createReport, reportReasons } from './reports.js'
+import { issueMediaTicket, verifyMediaTicket } from './mediaTicket.js'
+import { NATIVE_ORIGINS } from './origins.js'
+import { registerDevice, unregisterDevice, removeDevicesForSession, removeDevicesForSessionHash, removeDevicesForUser } from './push.js'
+import { apnsConfigured } from './apns.js'
+import { vapidPublicKey } from './webpush.js'
 
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err)
@@ -82,6 +94,8 @@ const upload = multer({
         'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov',
         'audio/webm': '.webm', 'audio/ogg': '.ogg', 'application/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a',
         'audio/wav': '.wav', 'application/pdf': '.pdf', 'text/plain': '.txt', 'application/zip': '.zip',
+        // Зашифрованное вложение: сервер видит только байты и не знает, что внутри.
+        'application/octet-stream': '.bin',
       }
       cb(null, `${crypto.randomUUID()}${extensions[file.mimetype] ?? ''}`)
     },
@@ -93,6 +107,10 @@ const upload = multer({
       'video/mp4', 'video/webm', 'video/quicktime',
       'audio/webm', 'audio/ogg', 'application/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav',
       'application/pdf', 'text/plain', 'text/csv', 'application/zip',
+      // Вложения из зашифрованных чатов приезжают сюда шифротекстом. Список
+      // типов и раньше не был защитой — Content-Type задаёт клиент, — а служил
+      // подсказкой о том, что мессенджер умеет показывать.
+      'application/octet-stream',
       'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'application/vnd.ms-powerpoint', 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -102,9 +120,24 @@ const upload = multer({
   },
 })
 
+/**
+ * Один прогон тестов создаёт больше аккаунтов и делает больше «чувствительных»
+ * действий, чем разумно позволять живому серверу. Флаг задают только тесты и
+ * только для одноразовой базы — поэтому он явный, а не выводится из NODE_ENV,
+ * который на боевом хостинге можно и забыть выставить.
+ */
+const RATE_LIMITS_RELAXED = process.env.RELAX_RATE_LIMITS === '1'
+if (RATE_LIMITS_RELAXED) {
+  console.warn('ВНИМАНИЕ: RELAX_RATE_LIMITS=1 — ограничения на регистрацию и вход практически сняты. Только для тестов.')
+}
+
+function limitFor(normal) {
+  return RATE_LIMITS_RELAXED ? 10_000 : normal
+}
+
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: limitFor(10),
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
@@ -113,7 +146,7 @@ const loginLimiter = rateLimit({
 
 const twoFactorLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 8,
+  limit: limitFor(8),
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
@@ -122,7 +155,7 @@ const twoFactorLimiter = rateLimit({
 
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  limit: 5,
+  limit: limitFor(5),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Слишком много регистраций. Попробуйте позже.' },
@@ -130,7 +163,7 @@ const registerLimiter = rateLimit({
 
 const sensitiveActionLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  limit: 8,
+  limit: limitFor(8),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Слишком много попыток. Попробуйте позже.' },
@@ -193,6 +226,21 @@ function setSessionCookie(req, res, token) {
   res.setHeader('Set-Cookie', attributes.join('; '))
 }
 
+/**
+ * Нативной обёртке куки не подходят: страница грузится с capacitor://localhost, и
+ * Set-Cookie домена API там третьесторонняя — WKWebView её обратно не пришлёт.
+ * Такому клиенту отдаём session token прямо в теле ответа, он кладёт его в
+ * Keychain и ходит с Authorization: Bearer. В браузере ничего не меняется:
+ * токен остаётся только в HttpOnly-куке, недоступной для XSS.
+ */
+function isNativeClient(req) {
+  return String(req.headers['x-client'] ?? '').toLowerCase() === 'native'
+}
+
+function sessionPayload(req, session) {
+  return isNativeClient(req) ? { user: session.user, token: session.token } : { user: session.user }
+}
+
 function clearSessionCookie(req, res) {
   const attributes = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0']
   if (isSecureRequest(req)) attributes.push('Secure')
@@ -202,6 +250,7 @@ function clearSessionCookie(req, res) {
 function isAllowedOrigin(req, origin) {
   if (!origin) return true
   if (configuredOrigins.has(origin)) return true
+  if (NATIVE_ORIGINS.has(origin)) return true
   try {
     const source = new URL(origin)
     const forwardedHost = String(req.headers['x-forwarded-host'] ?? '').split(',')[0].trim()
@@ -240,7 +289,7 @@ app.use(cors((req, callback) => {
     origin: allowed && origin ? origin : false,
     credentials: true,
     methods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Client'],
   })
 }))
 app.use(express.json({ limit: '1mb' }))
@@ -276,7 +325,20 @@ app.use(['/api/auth', '/api/me'], (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store')
   next()
 })
-app.use('/uploads', authMiddleware, express.static(uploadsDir, { fallthrough: false, maxAge: '1h' }))
+/**
+ * `<img src>` не умеет слать Authorization, а куки на capacitor:// не уходят —
+ * нативный клиент вместо этого подставляет короткоживущий билет в query.
+ * Браузерная версия сюда не попадает и авторизуется как раньше.
+ */
+function mediaAuthMiddleware(req, res, next) {
+  const ticket = typeof req.query.t === 'string' ? req.query.t : null
+  if (!ticket) return authMiddleware(req, res, next)
+  verifyMediaTicket(ticket)
+    .then((valid) => (valid ? next() : authMiddleware(req, res, next)))
+    .catch(() => authMiddleware(req, res, next))
+}
+
+app.use('/uploads', mediaAuthMiddleware, express.static(uploadsDir, { fallthrough: false, maxAge: '1h' }))
 
 function withOnline(chat) {
   return { ...chat, members: chat.members.map((m) => ({ ...m, online: isOnline(m.id) })) }
@@ -294,7 +356,7 @@ app.post(
     const session = await register(username ?? '', password ?? '', req.headers['user-agent'])
     req.auditUser = session.user
     setSessionCookie(req, res, session.token)
-    res.status(201).json({ user: session.user })
+    res.status(201).json(sessionPayload(req, session))
   }),
 )
 
@@ -310,7 +372,7 @@ app.post(
     }
     req.auditUser = session.user
     setSessionCookie(req, res, session.token)
-    res.json({ user: session.user })
+    res.json(sessionPayload(req, session))
   }),
 )
 
@@ -322,7 +384,7 @@ app.post(
     const session = await verifyTwoFactorLogin(pendingToken ?? '', code ?? '', req.headers['user-agent'])
     req.auditUser = session.user
     setSessionCookie(req, res, session.token)
-    res.json({ user: session.user })
+    res.json(sessionPayload(req, session))
   }),
 )
 
@@ -339,6 +401,7 @@ app.post('/api/auth/logout', asyncRoute(async (req, res) => {
   const header = req.headers.authorization || ''
   const token = req.sessionToken ?? (header.startsWith('Bearer ') ? header.slice(7).trim() : null)
   disconnectSession(token)
+  await removeDevicesForSession(token)
   await deleteSession(token)
   clearSessionCookie(req, res)
   res.json({ ok: true })
@@ -362,7 +425,39 @@ app.post(
     const { oldPassword, newPassword } = req.body ?? {}
     const session = await changePassword(req.user.id, oldPassword ?? '', newPassword ?? '', req.headers['user-agent'])
     disconnectUser(req.user.id)
+    // Смена пароля стирает все сессии — устройства уходят вместе с ними,
+    // иначе на них продолжили бы приходить пуши после «выйти везде».
+    await removeDevicesForUser(req.user.id)
     setSessionCookie(req, res, session.token)
+    // Смена пароля выпускает новую сессию: без свежего токена нативный клиент
+    // разлогинился бы сам себя сразу после успешной смены.
+    res.json({ ok: true, ...(isNativeClient(req) ? { token: session.token } : {}) })
+  }),
+)
+
+app.delete(
+  '/api/me',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    const { password, code } = req.body ?? {}
+    req.auditUser = req.user
+    const { files, removedChats, groupChatIds } = await deleteAccount(req.user.id, password ?? '', code ?? '')
+    // Сокеты держат сессии, которых больше нет в базе: без явного разрыва они
+    // проживут до ближайшего heartbeat и будут выглядеть как онлайн-призрак.
+    disconnectUser(req.user.id)
+    // Собеседникам чат надо убрать сразу, а группам — обновить список участников,
+    // иначе до перезагрузки у них останется чат с несуществующим человеком.
+    for (const { chatId, memberIds } of removedChats) {
+      for (const memberId of memberIds) notifyChatLeft(memberId, chatId)
+    }
+    await Promise.all(groupChatIds.map((chatId) => notifyChatUpdated(chatId).catch(() => undefined)))
+    for (const url of files) {
+      // Имя уже проверено на стороне auth.js — сюда доходят только ссылки вида
+      // /uploads/<безопасное-имя>.
+      await fs.promises.unlink(path.join(uploadsDir, path.basename(url))).catch(() => undefined)
+    }
+    clearSessionCookie(req, res)
     res.json({ ok: true })
   }),
 )
@@ -382,7 +477,10 @@ app.delete(
   asyncRoute(async (req, res) => {
     const sessionId = req.params.id
     const revoked = await revokeSession(req.user.id, sessionId)
-    if (revoked) disconnectSessionByHash(sessionId)
+    if (revoked) {
+      disconnectSessionByHash(sessionId)
+      await removeDevicesForSessionHash(sessionId)
+    }
     res.json({ ok: revoked })
   }),
 )
@@ -393,7 +491,10 @@ app.delete(
   sensitiveActionLimiter,
   asyncRoute(async (req, res) => {
     const revokedHashes = await revokeOtherSessions(req.user.id, req.authToken)
-    for (const hash of revokedHashes) disconnectSessionByHash(hash)
+    for (const hash of revokedHashes) {
+      disconnectSessionByHash(hash)
+      await removeDevicesForSessionHash(hash)
+    }
     res.json({ ok: true, count: revokedHashes.length })
   }),
 )
@@ -472,7 +573,7 @@ app.post(
   asyncRoute(async (req, res) => {
     const session = await resetPasswordWithToken(req.body?.token ?? '', req.body?.newPassword ?? '', req.headers['user-agent'])
     setSessionCookie(req, res, session.token)
-    res.json({ user: session.user })
+    res.json(sessionPayload(req, session))
   }),
 )
 
@@ -491,6 +592,32 @@ app.post(
   asyncRoute(async (req, res) => {
     await unblockUser(req.user.id, Number(req.params.id))
     res.json({ ok: true })
+  }),
+)
+
+/**
+ * Приём жалоб на контент и на пользователей. Лимит отдельный и мягче
+ * «чувствительных» действий: пожаловаться на несколько сообщений подряд —
+ * нормальный сценарий, а не подозрительный.
+ */
+const reportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: limitFor(30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Слишком много жалоб. Попробуйте позже.' },
+})
+
+app.get('/api/reports/reasons', (req, res) => {
+  res.json({ reasons: reportReasons() })
+})
+
+app.post(
+  '/api/reports',
+  authMiddleware,
+  reportLimiter,
+  asyncRoute(async (req, res) => {
+    res.json(await createReport(req.user.id, req.body ?? {}))
   }),
 )
 
@@ -550,7 +677,7 @@ app.get(
   asyncRoute(async (req, res) => {
     const chatId = Number(req.params.id)
     if (!(await isMember(chatId, req.user.id))) return res.status(403).json({ error: 'Нет доступа к чату' })
-    res.json({ messages: await getMessages(chatId) })
+    res.json({ messages: await getMessages(chatId, req.user.id) })
   }),
 )
 
@@ -600,9 +727,148 @@ app.get(
   }),
 )
 
+app.get('/api/push/config', authMiddleware, (req, res) => {
+  res.json({ vapidPublicKey: vapidPublicKey(), apnsEnabled: apnsConfigured() })
+})
+
+app.post(
+  '/api/push/devices',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const ok = await registerDevice(req.user.id, req.authToken, req.body ?? {})
+    if (!ok) return res.status(400).json({ error: 'Некорректные данные устройства' })
+    res.json({ ok: true })
+  }),
+)
+
+app.delete(
+  '/api/push/devices',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    await unregisterDevice(req.user.id, req.body?.provider, String(req.body?.token ?? ''))
+    res.json({ ok: true })
+  }),
+)
+
+app.get(
+  '/api/media-ticket',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const issued = await issueMediaTicket(req.authToken)
+    if (!issued) return res.status(401).json({ error: 'Требуется авторизация', code: 'UNAUTHORIZED' })
+    res.json(issued)
+  }),
+)
+
 app.get('/api/ice-servers', authMiddleware, (req, res) => {
   res.json({ iceServers: buildIceServers() })
 })
+
+app.post(
+  '/api/crypto/keys',
+  authMiddleware,
+  sensitiveActionLimiter,
+  asyncRoute(async (req, res) => {
+    const { x25519PublicKey, ed25519PublicKey, publicKeySignature } = req.body ?? {}
+    await storePublicKeys(req.user.id, { x25519PublicKey, ed25519PublicKey, publicKeySignature })
+    res.json({ ok: true })
+  }),
+)
+
+app.get(
+  '/api/crypto/keys',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const ids = String(req.query.ids || '')
+      .split(',')
+      .map((id) => Number(id.trim()))
+      .filter((id) => Number.isInteger(id) && id > 0)
+      .slice(0, 100)
+    res.json({ keys: await getPublicKeyBundles(ids) })
+  }),
+)
+
+app.get(
+  '/api/chats/:id/keys',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const chatId = Number(req.params.id)
+    if (!(await isMember(chatId, req.user.id))) return res.status(403).json({ error: 'Нет доступа к чату' })
+    const ids = await membersOf(chatId)
+    res.json({ keys: await getPublicKeyBundles(ids) })
+  }),
+)
+
+app.get(
+  '/api/folders',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    res.json({ folders: await listFolders(req.user.id) })
+  }),
+)
+
+app.post(
+  '/api/folders',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const id = await createFolder(req.user.id, req.body?.name, req.body?.chatIds)
+    res.json({ id, folders: await listFolders(req.user.id) })
+  }),
+)
+
+app.patch(
+  '/api/folders/:id',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const folderId = Number(req.params.id)
+    if (req.body?.name !== undefined) await renameFolder(req.user.id, folderId, req.body.name)
+    if (req.body?.chatIds !== undefined) await setFolderChats(req.user.id, folderId, req.body.chatIds)
+    res.json({ folders: await listFolders(req.user.id) })
+  }),
+)
+
+app.delete(
+  '/api/folders/:id',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    await deleteFolder(req.user.id, Number(req.params.id))
+    res.json({ folders: await listFolders(req.user.id) })
+  }),
+)
+
+app.patch(
+  '/api/chats/:id/archive',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const chatId = Number(req.params.id)
+    await setArchived(chatId, req.user.id, Boolean(req.body?.archived))
+    res.json({ chat: withOnline(await getChatForViewer(chatId, req.user.id)) })
+  }),
+)
+
+app.patch(
+  '/api/chats/:id/mute',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const chatId = Number(req.params.id)
+    const mutedUntil = req.body?.mutedUntil ?? null
+    await setMuted(chatId, req.user.id, mutedUntil)
+    res.json({ chat: withOnline(await getChatForViewer(chatId, req.user.id)) })
+  }),
+)
+
+app.patch(
+  '/api/chats/:id/auto-delete',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const chatId = Number(req.params.id)
+    const seconds = Number(req.body?.seconds)
+    await setAutoDelete(chatId, req.user.id, seconds)
+    // Таймер общий для чата — все участники должны увидеть смену сразу.
+    await notifyChatUpdated(chatId)
+    res.json({ ok: true, seconds, options: AUTO_DELETE_OPTIONS })
+  }),
+)
 
 app.post('/api/upload', authMiddleware, uploadLimiter, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не получен' })
@@ -633,6 +899,7 @@ async function start() {
   await initSchema()
   const server = http.createServer(app)
   const wss = attachWebSocket(server)
+  const stopAutoDeleteSweeper = startAutoDeleteSweeper(notifyMessagesExpired)
 
   let shuttingDown = false
   async function shutdown(signal) {
@@ -645,6 +912,7 @@ async function start() {
     }, 10_000)
     forceExitTimer.unref()
 
+    stopAutoDeleteSweeper()
     server.close()
     for (const client of wss.clients) {
       client.close(1012, 'Server restarting')

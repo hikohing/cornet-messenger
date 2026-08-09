@@ -1,6 +1,7 @@
 import { one, many, run } from './db.js'
 import { appError } from './errors.js'
 import { isBlockedEitherWay } from './blocking.js'
+import { attachPolls } from './polls.js'
 
 function toPublicUserRow(row) {
   return {
@@ -42,9 +43,22 @@ function toPublicMessage(row) {
     editedAt: row.edited_at ? Number(row.edited_at) : null,
     deleted: row.deleted,
     callMeta: row.call_meta ?? null,
+    encrypted: Boolean(row.encrypted),
+    encryptionData: row.encryption_data ?? null,
     createdAt: Number(row.created_at),
   }
 }
+
+/**
+ * Уборщик просроченных сообщений ходит раз в минуту, поэтому при чтении
+ * дополнительно отсекаем те, чей срок уже вышел, — иначе сообщение висело бы
+ * в чате до следующего прохода.
+ */
+const NOT_EXPIRED = `
+  AND (
+    (SELECT auto_delete_seconds FROM chats WHERE chats.id = messages.chat_id) = 0
+    OR messages.created_at + ((SELECT auto_delete_seconds FROM chats WHERE chats.id = messages.chat_id) * 1000) > $EXPIRY_NOW
+  )`
 
 export async function searchUsers(query, excludeUserId) {
   query = query.trim().replace(/^@/, '')
@@ -124,7 +138,7 @@ export async function createGroupChat(creatorId, name, usernames) {
 }
 
 export async function hydrateChat(chatId, viewerId) {
-  const chatRow = await one('SELECT id, type, name, description, avatar_url, pinned_message_id FROM chats WHERE id = $1', [chatId])
+  const chatRow = await one('SELECT id, type, name, description, avatar_url, pinned_message_id, auto_delete_seconds FROM chats WHERE id = $1', [chatId])
   const memberRows = await many(
     `SELECT users.id, users.username, users.display_name, users.color, users.avatar_url, users.banner_url, users.banner_style, users.avatar_decoration, users.profile_effect, users.profile_theme, users.name_style, users.profile_frame, users.nameplate_style, users.profile_primary_color, users.profile_secondary_color, users.show_last_seen, users.status_text, users.bio, users.birth_date, users.last_seen_at, users.created_at
      FROM chat_members JOIN users ON users.id = chat_members.user_id WHERE chat_members.chat_id = $1`,
@@ -135,8 +149,10 @@ export async function hydrateChat(chatId, viewerId) {
     'SELECT user_id as "userId", last_read_message_id as "lastReadMessageId" FROM chat_members WHERE chat_id = $1',
     [chatId],
   )
-  const viewerRow = await one('SELECT pinned FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, viewerId])
+  const viewerRow = await one('SELECT pinned, archived, muted_until FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, viewerId])
   const pinned = Boolean(viewerRow?.pinned)
+  const archived = Boolean(viewerRow?.archived)
+  const mutedUntil = viewerRow?.muted_until ? Number(viewerRow.muted_until) : null
   const unread = await one(
     `SELECT COUNT(*)::int as count FROM messages
      WHERE chat_id = $1 AND sender_id != $2 AND deleted = false
@@ -167,6 +183,11 @@ export async function hydrateChat(chatId, viewerId) {
     unreadCount: unread.count,
     pinnedMessage,
     pinned,
+    archived,
+    // Просроченный мьют считается снятым, чтобы клиенту не приходилось
+    // сравнивать даты в каждом месте, где нужен признак «беззвучный».
+    mutedUntil: mutedUntil && mutedUntil > Date.now() ? mutedUntil : null,
+    autoDeleteSeconds: Number(chatRow.auto_delete_seconds ?? 0),
   }
 }
 
@@ -186,18 +207,22 @@ export async function updateChatInfo(chatId, userId, { name, description, avatar
   return getChatForViewer(chatId, userId)
 }
 
-export async function getLastMessage(chatId) {
+export async function getLastMessage(chatId, viewerId) {
   const last = await one(
-    'SELECT * FROM messages WHERE chat_id = $1 AND deleted = false ORDER BY created_at DESC LIMIT 1',
-    [chatId],
+    `SELECT * FROM messages WHERE chat_id = $1 AND deleted = false ${NOT_EXPIRED.replace('$EXPIRY_NOW', '$2')} ORDER BY created_at DESC LIMIT 1`,
+    [chatId, Date.now()],
   )
-  return last ? toPublicMessage(last) : null
+  if (!last) return null
+  // Опрос подтягиваем и сюда: без этого превью в списке чатов показывало бы
+  // безликое «Опрос» вместо самого вопроса.
+  const [withPoll] = await attachPolls([toPublicMessage(last)], viewerId)
+  return withPoll
 }
 
 /** Full chat payload for one viewer, including its latest visible message. */
 export async function getChatForViewer(chatId, viewerId) {
   const hydrated = await hydrateChat(chatId, viewerId)
-  return { ...hydrated, lastMessage: await getLastMessage(chatId) }
+  return { ...hydrated, lastMessage: await getLastMessage(chatId, viewerId) }
 }
 
 /** Saved chat first, then pinned chats, then most recently active chats. */
@@ -242,15 +267,29 @@ async function attachExtras(messages) {
   }))
 }
 
-export async function getMessages(chatId) {
-  const rows = await many('SELECT * FROM messages WHERE chat_id = $1 ORDER BY created_at ASC', [chatId])
-  return attachExtras(rows.map(toPublicMessage))
+export async function getMessages(chatId, viewerId) {
+  const rows = await many(
+    `SELECT * FROM messages WHERE chat_id = $1 ${NOT_EXPIRED.replace('$EXPIRY_NOW', '$2')} ORDER BY created_at ASC`,
+    [chatId, Date.now()],
+  )
+  const messages = await attachExtras(rows.map(toPublicMessage))
+  return attachPolls(messages, viewerId)
+}
+
+/** Одно сообщение вместе с реакциями, цитатой и опросом — для рассылки после изменения. */
+export async function getMessageById(messageId, viewerId) {
+  const row = await one('SELECT * FROM messages WHERE id = $1', [messageId])
+  if (!row) return null
+  const [withExtras] = await attachExtras([toPublicMessage(row)])
+  const [withPoll] = await attachPolls([withExtras], viewerId)
+  return withPoll
 }
 
 export async function searchMessages(chatId, query) {
   const rows = await many(
-    "SELECT * FROM messages WHERE chat_id = $1 AND deleted = false AND type <> 'call' AND text ILIKE $2 ORDER BY created_at DESC LIMIT 30",
-    [chatId, `%${query}%`],
+    `SELECT * FROM messages WHERE chat_id = $1 AND deleted = false AND type <> 'call' AND text ILIKE $2
+     ${NOT_EXPIRED.replace('$EXPIRY_NOW', '$3')} ORDER BY created_at DESC LIMIT 30`,
+    [chatId, `%${query}%`, Date.now()],
   )
   return attachExtras(rows.map(toPublicMessage))
 }
@@ -260,7 +299,7 @@ export function isSafeAttachmentUrl(url) {
   return typeof url === 'string' && /^\/uploads\/[A-Za-z0-9._-]{1,120}$/.test(url) && !url.includes('..')
 }
 
-export async function addMessage(chatId, senderId, { type = 'text', text = '', attachmentUrl = null, attachment = null, replyToId = null, forwarded = false, callMeta = null }) {
+export async function addMessage(chatId, senderId, { type = 'text', text = '', attachmentUrl = null, attachment = null, replyToId = null, forwarded = false, callMeta = null, encrypted = false, encryptionData = null }) {
   if (attachmentUrl !== null && !isSafeAttachmentUrl(attachmentUrl)) {
     throw appError('Недопустимое вложение')
   }
@@ -274,22 +313,35 @@ export async function addMessage(chatId, senderId, { type = 'text', text = '', a
   }
   const createdAt = Date.now()
   const row = await one(
-    `INSERT INTO messages (chat_id, sender_id, type, text, attachment_url, attachment_meta, reply_to_id, forwarded, call_meta, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-    [chatId, senderId, type, text, attachmentUrl, attachment ? JSON.stringify(attachment) : null, replyToId, forwarded, callMeta ? JSON.stringify(callMeta) : null, createdAt],
+    `INSERT INTO messages (chat_id, sender_id, type, text, attachment_url, attachment_meta, reply_to_id, forwarded, call_meta, encrypted, encryption_data, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+    [chatId, senderId, type, text, attachmentUrl, attachment ? JSON.stringify(attachment) : null, replyToId, forwarded, callMeta ? JSON.stringify(callMeta) : null, Boolean(encrypted), encryptionData ? JSON.stringify(encryptionData) : null, createdAt],
   )
   const [withExtras] = await attachExtras([toPublicMessage(row)])
   return withExtras
 }
 
-export async function editMessage(messageId, userId, text) {
+export async function editMessage(messageId, userId, text, encryptionData = undefined) {
   const message = await one('SELECT * FROM messages WHERE id = $1', [messageId])
   if (!message || message.sender_id !== userId || message.deleted) return null
   if (message.type !== 'text') return null
   if (!(await isMember(message.chat_id, userId))) return null
+  // An encrypted message must be re-encrypted client-side and resubmitted with
+  // fresh encryptionData — plaintext can never overwrite an encrypted row, or
+  // the "encrypted" flag would lie about what's actually stored.
+  if (message.encrypted && encryptionData === undefined) return null
   const editedAt = Date.now()
-  await run('UPDATE messages SET text = $1, edited_at = $2 WHERE id = $3', [text, editedAt, messageId])
-  const [withExtras] = await attachExtras([toPublicMessage({ ...message, text, edited_at: editedAt })])
+  const nextEncrypted = encryptionData !== undefined
+  await run('UPDATE messages SET text = $1, edited_at = $2, encrypted = $3, encryption_data = $4 WHERE id = $5', [
+    nextEncrypted ? '' : text,
+    editedAt,
+    nextEncrypted,
+    nextEncrypted ? JSON.stringify(encryptionData) : null,
+    messageId,
+  ])
+  const [withExtras] = await attachExtras([
+    toPublicMessage({ ...message, text: nextEncrypted ? '' : text, edited_at: editedAt, encrypted: nextEncrypted, encryption_data: nextEncrypted ? encryptionData : null }),
+  ])
   return withExtras
 }
 
@@ -297,9 +349,18 @@ export async function deleteMessage(messageId, userId) {
   const message = await one('SELECT * FROM messages WHERE id = $1', [messageId])
   if (!message || message.deleted) return null
   if (!(await isMember(message.chat_id, userId))) return null
-  await run("UPDATE messages SET deleted = true, text = '', attachment_url = NULL, attachment_meta = NULL WHERE id = $1", [messageId])
+  // encryption_data затирается вместе с текстом: иначе «удалённое» сообщение
+  // оставляло бы в базе полный шифротекст, который получатель со своими
+  // ключами прекрасно прочитает — то есть удаление было бы только на вид.
+  await run(
+    `UPDATE messages
+     SET deleted = true, text = '', attachment_url = NULL, attachment_meta = NULL,
+         encrypted = false, encryption_data = NULL
+     WHERE id = $1`,
+    [messageId],
+  )
   // Callers rebroadcast the surviving last message so chat previews stay accurate.
-  return { chatId: message.chat_id, messageId, lastMessage: await getLastMessage(message.chat_id) }
+  return { chatId: message.chat_id, messageId, lastMessage: await getLastMessage(message.chat_id, userId) }
 }
 
 export async function toggleReaction(messageId, userId, emoji) {
@@ -332,6 +393,11 @@ export async function forwardMessage(userId, sourceMessageId, targetChatId) {
   const source = await one('SELECT * FROM messages WHERE id = $1', [sourceMessageId])
   if (!source || source.deleted) throw appError('Сообщение не найдено')
   if (source.type === 'call') throw appError('Запись о звонке нельзя переслать')
+  // Encrypted content is bound to the original chat's key material — the server
+  // cannot re-encrypt it for a different chat, and forwarding it as-is would be
+  // undecryptable ciphertext. Clients must decrypt and resend as plaintext-in,
+  // which produces a fresh non-forwarded encrypted message instead.
+  if (source.encrypted) throw appError('Зашифрованное сообщение нельзя переслать напрямую')
   if (!(await isMember(source.chat_id, userId))) throw appError('Нет доступа к исходному чату')
   return addMessage(targetChatId, userId, {
     type: source.type,

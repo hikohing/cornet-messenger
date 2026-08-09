@@ -42,11 +42,38 @@ jobs:
       - run: npm ci
       - name: Install server dependencies
         run: cd server && npm ci
+      # Одноразовые ключи на прогон: без них тесты доставки пушей и VoIP-звонков
+      # пропускаются. APNS_HOST уводит отправку на мок, поднимаемый самим тестом.
+      - name: Generate push keys
+        run: |
+          node -e "
+            const fs = require('fs')
+            const crypto = require('crypto')
+            const keys = require('./server/node_modules/web-push').generateVAPIDKeys()
+            const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+            fs.writeFileSync('apns-ci.p8', privateKey.export({ type: 'pkcs8', format: 'pem' }))
+            fs.appendFileSync(process.env.GITHUB_ENV, 'VAPID_PUBLIC_KEY=' + keys.publicKey + '\n')
+            fs.appendFileSync(process.env.GITHUB_ENV, 'VAPID_PRIVATE_KEY=' + keys.privateKey + '\n')
+          "
+          # Многострочное значение в GITHUB_ENV передаётся только через разделитель.
+          {
+            echo 'APNS_KEY<<APNS_KEY_EOF'
+            cat apns-ci.p8
+            echo 'APNS_KEY_EOF'
+          } >> "$GITHUB_ENV"
+          rm apns-ci.p8
       - name: Start server
         run: node server/src/index.js &
         env:
           DATABASE_URL: postgres://postgres@localhost:5432/connecto
           PORT: 4000
+          VAPID_SUBJECT: mailto:ci@example.com
+          APNS_KEY_ID: CITESTKEY1
+          APNS_TEAM_ID: CITESTTEAM
+          APNS_BUNDLE_ID: app.cornet.messenger
+          APNS_HOST: http://127.0.0.1:4455
+          # Один прогон создаёт больше аккаунтов, чем позволяет боевой лимит.
+          RELAX_RATE_LIMITS: '1'
       - name: Wait for server
         run: |
           for i in $(seq 1 30); do
@@ -58,3 +85,6 @@ jobs:
       - run: npm test
         env:
           TEST_BASE_URL: http://localhost:4000
+          # Тест реестра звонков работает с модулем напрямую, а тот тянет за
+          # собой подключение к базе.
+          DATABASE_URL: postgres://postgres@localhost:5432/connecto

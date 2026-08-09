@@ -4,6 +4,12 @@ import type { RemoteCallState, SocketApi, SocketEvent } from '../api/socket'
 import type { User } from '../types'
 import type { AppPreferences, CallRingtonePreference } from './usePreferences'
 import { showToast } from './useToast'
+import {
+  isCallKitCall,
+  reportConnectedToCallKit,
+  reportEndedToCallKit,
+  reportOutgoingToCallKit,
+} from '../native/callkit'
 
 /** Сколько ждём ответа, прежде чем считать звонок пропущенным (сервер страхует на 60 с). */
 const RING_TIMEOUT_MS = 45_000
@@ -136,6 +142,8 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([])
   const remoteDescSetRef = useRef(false)
   const incomingOfferRef = useRef<RTCSessionDescriptionInit | null>(null)
+  /** «Принять» на системном экране могли нажать до того, как приглашение доехало по сокету. */
+  const pendingCallKitAnswerRef = useRef<string | null>(null)
   const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const ringLoopRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const reconnectWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -355,6 +363,9 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
     const wasConnected = current.status === 'connected'
     teardownCall()
     applyCall(null)
+    // Системный экран звонка живёт своей жизнью — без этого он останется висеть
+    // поверх всего, когда звонок уже закончился.
+    reportEndedToCallKit(current.callId, reason)
     if (wasConnected) playEndedTone()
     if (LOCAL_END_REASON_LABEL[reason]) showToast(LOCAL_END_REASON_LABEL[reason])
   }
@@ -456,6 +467,7 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
   function markConnected(callId: string) {
     stopRingLoop()
     stopTitleFlash()
+    reportConnectedToCallKit(callId)
     void acquireWakeLock()
     patchCall(callId, (prev) => (prev.status === 'connected' ? {} : { status: 'connected' }))
     sendLocalState()
@@ -517,6 +529,9 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
       minimized: false,
       remote: IDLE_REMOTE_STATE,
     })
+    // Исходящий тоже отдаём CallKit: иначе система не знает, что линия занята,
+    // и звонок не попадёт в журнал вызовов.
+    reportOutgoingToCallKit(callId, otherUser.displayName || otherUser.username, video)
     startRingLoop('outgoing')
 
     try {
@@ -541,23 +556,32 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
   }
 
   async function handleIncomingInvite(event: Extract<SocketEvent, { type: 'call_invite' }>) {
+    // Отказ до того, как звонок стал «нашим»: системный экран уже мог
+    // показаться, и его надо погасить вместе с отказом.
+    function refuseIncoming(reason: string) {
+      getSocket()?.callEnd(event.callId, reason)
+      reportEndedToCallKit(event.callId, reason)
+    }
+
     if (callRef.current) {
-      getSocket()?.callEnd(event.callId, 'busy')
+      refuseIncoming('busy')
       return
     }
     if (getPreferences().doNotDisturbCalls) {
-      getSocket()?.callEnd(event.callId, 'dnd')
+      refuseIncoming('dnd')
       return
     }
     const otherUser = await resolvePeer(event.chatId, event.fromUserId)
     if (!otherUser) {
-      getSocket()?.callEnd(event.callId, 'invalid')
+      refuseIncoming('invalid')
       return
     }
     if (callRef.current) {
-      getSocket()?.callEnd(event.callId, 'busy')
+      refuseIncoming('busy')
       return
     }
+
+    const viaCallKit = isCallKitCall(event.callId)
 
     incomingOfferRef.current = event.sdp
     applyCall({
@@ -589,9 +613,51 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
       return
     }
 
-    startRingLoop('incoming')
-    notifyIncoming(otherUser, event.video)
+    // Звонок, пришедший через CallKit, уже звонит и показан системой — свой
+    // рингтон и своё уведомление поверх этого были бы вторым звонком.
+    if (!viaCallKit) {
+      startRingLoop('incoming')
+      notifyIncoming(otherUser, event.video)
+    }
     getSocket()?.callRinging(event.callId)
+
+    // «Принять» на системном экране могли нажать раньше, чем приглашение
+    // добралось до приложения — тогда приём ждал именно этого момента.
+    if (pendingCallKitAnswerRef.current === event.callId) {
+      pendingCallKitAnswerRef.current = null
+      void acceptCall()
+    }
+  }
+
+  /**
+   * Устройство разбудил VoIP-пуш: приглашение с оффером лежит на сервере и
+   * ждёт, пока мы поднимем сокет и попросим его.
+   */
+  function claimIncomingCall(callId: string) {
+    getSocket()?.callClaim(callId)
+  }
+
+  /** Ответ с системного экрана CallKit. */
+  function acceptFromCallKit(callId: string) {
+    const current = callRef.current
+    if (current?.callId === callId && current.status === 'incoming') {
+      void acceptCall()
+      return
+    }
+    pendingCallKitAnswerRef.current = callId
+  }
+
+  /** Сброс с системного экрана CallKit. */
+  function endFromCallKit(callId: string) {
+    if (pendingCallKitAnswerRef.current === callId) pendingCallKitAnswerRef.current = null
+    const current = callRef.current
+    if (current?.callId !== callId) {
+      // Приглашение ещё не доехало — отказываемся напрямую, иначе звонящий
+      // будет слушать гудки до самого таймаута.
+      getSocket()?.callEnd(callId, 'reject')
+      return
+    }
+    endCall(current.status === 'connected' ? 'hangup' : 'reject', true)
   }
 
   async function acceptCall() {
@@ -653,15 +719,26 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
     endCall('hangup', true)
   }
 
-  function toggleMute() {
+  function applyMute(muted: boolean) {
     const current = callRef.current
-    if (!current) return
-    const muted = !current.muted
+    if (!current || current.muted === muted) return
     localStreamRef.current?.getAudioTracks().forEach((track) => {
       track.enabled = !muted
     })
     patchCall(current.callId, { muted })
     sendLocalState({ muted })
+  }
+
+  function toggleMute() {
+    const current = callRef.current
+    if (!current) return
+    applyMute(!current.muted)
+  }
+
+  /** Кнопкой «без звука» можно нажать и на системном экране звонка. */
+  function muteFromCallKit(callId: string, muted: boolean) {
+    if (callRef.current?.callId !== callId) return
+    applyMute(muted)
   }
 
   /** Включает камеру в аудиозвонке или переключает её состояние в видеозвонке. */
@@ -963,6 +1040,10 @@ export function useCallSession({ getSocket, getPreferences, updatePreferences, r
     handlePeerOffline,
     startCall,
     acceptCall,
+    claimIncomingCall,
+    acceptFromCallKit,
+    endFromCallKit,
+    muteFromCallKit,
     rejectCall,
     hangUp,
     toggleMute,

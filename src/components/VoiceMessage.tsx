@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { resolveUrl } from '../api/client'
 
 interface VoiceMessageProps {
-  url: string
+  /** Готовая ссылка: обычная для открытых вложений, blob: для расшифрованных. */
+  src: string
   duration?: number
   messageId: number
   label?: string
@@ -24,7 +24,7 @@ function PauseIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7V5Zm6 0h4v14h-4V5Z" fill="currentColor" /></svg>
 }
 
-export function VoiceMessage({ url, duration: suppliedDuration = 0, messageId, label = 'Голосовое' }: VoiceMessageProps) {
+export function VoiceMessage({ src, duration: suppliedDuration = 0, messageId, label = 'Голосовое' }: VoiceMessageProps) {
   const audioRef = useRef<HTMLAudioElement>(null)
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -74,7 +74,7 @@ export function VoiceMessage({ url, duration: suppliedDuration = 0, messageId, l
     <div className="voice-message">
       <audio
         ref={audioRef}
-        src={resolveUrl(url)}
+        src={src}
         preload="metadata"
         onLoadedMetadata={(event) => {
           if (Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration)

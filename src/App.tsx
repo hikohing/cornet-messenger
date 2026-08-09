@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react'
 import { AuthScreen } from './components/AuthScreen'
 import { CallOverlay } from './components/CallOverlay'
 import { ChatWindow } from './components/ChatWindow'
+import { FoldersModal } from './components/FoldersModal'
 import { InfoPanel } from './components/InfoPanel'
 import { LeftRail, type RailView } from './components/LeftRail'
+import { PrivacyPolicy } from './components/PrivacyPolicy'
 import { ResetPasswordScreen } from './components/ResetPasswordScreen'
 import { Sidebar } from './components/Sidebar'
 import { SettingsPanel } from './components/SettingsPanel'
@@ -12,6 +14,7 @@ import { VerifyEmailScreen } from './components/VerifyEmailScreen'
 import { SpinnerIcon } from './components/icons'
 import { useAuth } from './hooks/useAuth'
 import { useChats } from './hooks/useChats'
+import { useCrypto } from './hooks/useCrypto'
 import { usePreferences } from './hooks/usePreferences'
 import { showToast } from './hooks/useToast'
 import {
@@ -22,6 +25,8 @@ import {
   requestEmailVerification as apiRequestEmailVerification,
   unblockUser as apiUnblockUser,
 } from './api/client'
+import { enablePush, listenForPushOpens, syncPushPreferences } from './native/push'
+import { disableCallKit, enableCallKit, isCallKitAvailable, listenToCallKit } from './native/callkit'
 import './App.css'
 
 /** Ссылки из писем ведут сюда через query-параметры — работает независимо от того, залогинен ли человек в этом браузере. */
@@ -40,6 +45,9 @@ function App() {
   const [resetToken, clearResetToken] = useLinkParam('resetToken')
   const [verifyEmailToken, clearVerifyEmailToken] = useLinkParam('verifyEmail')
   const [startChatUsername, clearStartChatUsername] = useLinkParam('startChat')
+  // Уведомление, открытое при закрытом приложении, приносит чат в query —
+  // postMessage отправлять было некому, окна ещё не существовало.
+  const [pushChatId, clearPushChatId] = useLinkParam('openChat')
   const { preferences, updatePreferences, resetPreferences } = usePreferences()
   const {
     user,
@@ -55,6 +63,7 @@ function App() {
     verifyTwoFactor,
     cancelTwoFactor,
   } = useAuth()
+  const crypto = useCrypto(user?.id ?? null)
   const {
     chats,
     chatsLoaded,
@@ -67,6 +76,9 @@ function App() {
     sendMessage,
     editMessage,
     deleteMessage,
+    createPoll,
+    votePoll,
+    closePoll,
     sendTyping,
     markRead,
     react,
@@ -76,6 +88,11 @@ function App() {
     startChat,
     startGroupChat,
     toggleChatPinned,
+    folders,
+    toggleArchived,
+    toggleMuted,
+    saveFolder,
+    removeFolder,
     updateChatInfo,
     leaveChat,
     callSession,
@@ -83,8 +100,10 @@ function App() {
   const { call } = callSession
   const [selectedChatId, setSelectedChatId] = useState<number | null>(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [showPrivacy, setShowPrivacy] = useState(false)
   const [showInfoPanel, setShowInfoPanel] = useState(false)
   const [showNewChat, setShowNewChat] = useState(false)
+  const [showFolders, setShowFolders] = useState(false)
   const [railView, setRailView] = useState<RailView>('all')
   const [blockedUserIds, setBlockedUserIds] = useState<Set<number>>(new Set())
 
@@ -130,6 +149,87 @@ function App() {
     }
   }, [chats, chatsLoaded, selectedChatId])
 
+  // Пуш-устройство перерегистрируется при каждом запуске: APNs может выдать
+  // новый device token, а подписка Web Push — протухнуть на стороне браузера.
+  useEffect(() => {
+    if (!user || !preferences.notifications) return
+    void enablePush({
+      preview: preferences.messagePreview,
+      directEnabled: preferences.directNotifications,
+      groupEnabled: preferences.groupNotifications,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, preferences.notifications])
+
+  // Что показывать в уведомлении, решает сервер — значит, переключатели надо ему досылать.
+  useEffect(() => {
+    if (!user || !preferences.notifications) return
+    void syncPushPreferences({
+      preview: preferences.messagePreview,
+      directEnabled: preferences.directNotifications,
+      groupEnabled: preferences.groupNotifications,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferences.messagePreview, preferences.directNotifications, preferences.groupNotifications])
+
+  // Звонки при закрытом приложении не зависят от настроек уведомлений о
+  // сообщениях: токен PushKit выдаётся без спроса. Единственное, что их
+  // выключает — режим «не беспокоить»: будить телефон, чтобы тут же сбросить
+  // звонок, бессмысленно.
+  useEffect(() => {
+    if (!user || !isCallKitAvailable()) return
+    if (preferences.doNotDisturbCalls) {
+      void disableCallKit()
+      return
+    }
+    void enableCallKit()
+  }, [user, preferences.doNotDisturbCalls])
+
+  useEffect(() => {
+    if (!user || !isCallKitAvailable()) return
+    return listenToCallKit({
+      // Пуш разбудил приложение — приглашение с оффером ждёт нас на сервере.
+      onIncoming: (push) => callSession.claimIncomingCall(push.callId),
+      onAnswer: (callId) => callSession.acceptFromCallKit(callId),
+      onEnd: (callId) => callSession.endFromCallKit(callId),
+      onMute: (callId, muted) => callSession.muteFromCallKit(callId, muted),
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user])
+
+  // Тап по уведомлению открывает чат: из service worker — сообщением, из
+  // нативного слоя — событием, оба приходят сюда одним `push:open-chat`.
+  useEffect(() => {
+    const openChat = (event: Event) => {
+      const chatId = (event as CustomEvent<{ chatId: number }>).detail?.chatId
+      if (chatId) setSelectedChatId(chatId)
+    }
+    document.addEventListener('push:open-chat', openChat)
+    const stopListening = listenForPushOpens()
+    return () => {
+      document.removeEventListener('push:open-chat', openChat)
+      stopListening()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!user || !chatsLoaded || !pushChatId) return
+    const chatId = Number(pushChatId)
+    if (chats.some((chat) => chat.id === chatId)) setSelectedChatId(chatId)
+    clearPushChatId()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, chatsLoaded, pushChatId])
+
+  // Публичный адрес политики: ревьюер App Store и любой желающий открывают её
+  // по ссылке, без входа в аккаунт. Поэтому проверка идёт до всего остального.
+  if (window.location.pathname === '/privacy') {
+    return <PrivacyPolicy />
+  }
+
+  if (showPrivacy) {
+    return <PrivacyPolicy onClose={() => setShowPrivacy(false)} />
+  }
+
   if (resetToken) {
     return <ResetPasswordScreen token={resetToken} onDone={clearResetToken} />
   }
@@ -156,6 +256,7 @@ function App() {
           pendingTwoFactor={pendingTwoFactor}
           onVerifyTwoFactor={verifyTwoFactor}
           onCancelTwoFactor={cancelTwoFactor}
+          onOpenPrivacy={() => setShowPrivacy(true)}
         />
         <ToastHost />
       </>
@@ -202,6 +303,10 @@ function App() {
         onOpenSettings={() => setShowSettings(true)}
         onLogout={logout}
         onTogglePinned={toggleChatPinned}
+        folders={folders}
+        onToggleArchived={toggleArchived}
+        onToggleMuted={toggleMuted}
+        onManageFolders={() => setShowFolders(true)}
       />
       <ChatWindow
         chat={selectedChat}
@@ -219,7 +324,10 @@ function App() {
         onSend={(text, attachment, replyToId) =>
           selectedChat ? sendMessage(selectedChat.id, text, attachment, replyToId) : false
         }
-        onEdit={editMessage}
+        onEdit={(messageId, text) => editMessage(messageId, text, selectedChat?.id)}
+        onCreatePoll={(poll) => selectedChat && createPoll(selectedChat.id, poll)}
+        onVotePoll={votePoll}
+        onClosePoll={closePoll}
         onDelete={deleteMessage}
         onTyping={sendTyping}
         onMarkRead={markRead}
@@ -277,6 +385,16 @@ function App() {
           }}
         />
       )}
+      {showFolders && (
+        <FoldersModal
+          folders={folders}
+          chats={chats}
+          onSave={saveFolder}
+          onDelete={removeFolder}
+          onClose={() => setShowFolders(false)}
+        />
+      )}
+
       {showSettings && (
         <SettingsPanel
           user={user}
@@ -288,6 +406,21 @@ function App() {
           preferences={preferences}
           onUpdatePreferences={updatePreferences}
           onResetPreferences={resetPreferences}
+          onAccountDeleted={() => {
+            setShowSettings(false)
+            // Приватные ключи переживают обычный выход намеренно — без них не
+            // прочитать собственную историю после повторного входа. Но у
+            // удалённого аккаунта читать уже нечего, и оставлять их на
+            // устройстве значит не доделать ровно ту работу, ради которой
+            // кнопка и нужна.
+            crypto.reset()
+            logout()
+            showToast('Аккаунт удалён')
+          }}
+          onOpenPrivacy={() => {
+            setShowSettings(false)
+            setShowPrivacy(true)
+          }}
           onClose={() => setShowSettings(false)}
         />
       )}

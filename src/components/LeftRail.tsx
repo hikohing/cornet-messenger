@@ -1,7 +1,7 @@
 import type { ComponentType } from 'react'
-import { BookmarkIcon, ChatBubbleIcon, HomeIcon, PlusIcon, UsersIcon } from './icons'
+import { ArchiveIcon, BookmarkIcon, ChatBubbleIcon, HomeIcon, PlusIcon, UsersIcon } from './icons'
 
-export type RailView = 'all' | 'direct' | 'group' | 'saved'
+export type RailView = 'all' | 'direct' | 'group' | 'saved' | 'archive'
 
 interface LeftRailProps {
   activeView: RailView
@@ -15,6 +15,7 @@ const ITEMS: { view: RailView; label: string; icon: ComponentType<{ width: numbe
   { view: 'direct', label: 'Личные', icon: ChatBubbleIcon },
   { view: 'group', label: 'Группы', icon: UsersIcon },
   { view: 'saved', label: 'Избранное', icon: BookmarkIcon },
+  { view: 'archive', label: 'Архив', icon: ArchiveIcon },
 ]
 
 export function LeftRail({ activeView, createOpen, onSelectView, onCreateNew }: LeftRailProps) {

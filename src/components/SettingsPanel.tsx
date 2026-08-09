@@ -16,7 +16,8 @@ import type {
   ThemePreference,
   WallpaperPreference,
 } from '../hooks/usePreferences'
-import { getBlockedUsers, uploadFile, unblockUser as apiUnblockUser, getSessions, revokeSession as apiRevokeSession, revokeOtherSessions as apiRevokeOtherSessions, type SessionInfo, enrollTotp, confirmTotp, disableTotp } from '../api/client'
+import { getBlockedUsers, uploadFile, unblockUser as apiUnblockUser, getSessions, revokeSession as apiRevokeSession, revokeOtherSessions as apiRevokeOtherSessions, type SessionInfo, enrollTotp, confirmTotp, disableTotp, deleteAccount as apiDeleteAccount } from '../api/client'
+import { disablePush, enablePush } from '../native/push'
 import { AvatarImage } from './AvatarImage'
 import { AvatarLightbox } from './AvatarLightbox'
 import { ColorPicker } from './ColorPicker'
@@ -79,6 +80,9 @@ interface SettingsPanelProps {
   preferences: AppPreferences
   onUpdatePreferences: (patch: Partial<AppPreferences>) => void
   onResetPreferences: () => void
+  /** Аккаунта больше нет — приложению остаётся только выйти. */
+  onAccountDeleted: () => void
+  onOpenPrivacy: () => void
   onUpdateProfile: (patch: {
     username?: string
     color?: string
@@ -404,6 +408,128 @@ function ShareProfileCard({ username }: { username: string }) {
   )
 }
 
+/**
+ * Удаление аккаунта. Требование App Store (5.1.1v) и просто честное поведение:
+ * «удалить» должно означать удалить.
+ *
+ * Действие необратимое, поэтому подтверждений три: пароль, код второго фактора
+ * (если он включён) и имя пользователя, набранное вручную — от случайного
+ * нажатия пароль в менеджере паролей не спасает.
+ */
+function DeleteAccountSettings({ user, onDeleted }: { user: User; onDeleted: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [password, setPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [confirmName, setConfirmName] = useState('')
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const nameMatches = confirmName.trim().toLowerCase() === user.username.toLowerCase()
+
+  function close() {
+    setOpen(false)
+    setPassword('')
+    setCode('')
+    setConfirmName('')
+    setError(null)
+  }
+
+  async function handleDelete(e: React.FormEvent) {
+    e.preventDefault()
+    setError(null)
+    setDeleting(true)
+    try {
+      await apiDeleteAccount(password, code.trim() || undefined)
+      onDeleted()
+    } catch (err) {
+      setError((err as Error).message)
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <section className="settings-card settings-card--danger">
+      <div className="settings-card-title">
+        <h3>Удаление аккаунта</h3>
+        <p>Действие необратимое — восстановить аккаунт и переписку будет нельзя</p>
+      </div>
+
+      <ul className="settings-danger-list">
+        <li>Профиль, имя <strong className="notranslate" translate="no">@{user.username}</strong> и все настройки будут удалены</li>
+        <li>Личные переписки удалятся целиком — и у вас, и у собеседников</li>
+        <li>Ваши сообщения исчезнут из групп, сами группы останутся у остальных участников</li>
+        <li>Загруженные вами файлы, аватары и обложки будут стёрты с сервера</li>
+      </ul>
+
+      {!open ? (
+        <button type="button" className="settings-button settings-button--danger" onClick={() => setOpen(true)}>
+          Удалить аккаунт
+        </button>
+      ) : (
+        <form className="settings-password-form" onSubmit={handleDelete}>
+          <label htmlFor="delete-password">Текущий пароль</label>
+          <input
+            id="delete-password"
+            type="password"
+            className="text-input"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="current-password"
+          />
+
+          {user.totpEnabled && (
+            <>
+              <label htmlFor="delete-totp">Код из приложения-аутентификатора</label>
+              <input
+                id="delete-totp"
+                className="text-input"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={10}
+              />
+            </>
+          )}
+
+          <label htmlFor="delete-confirm">
+            Введите <strong className="notranslate" translate="no">{user.username}</strong>, чтобы подтвердить
+          </label>
+          <input
+            id="delete-confirm"
+            className="text-input"
+            value={confirmName}
+            onChange={(e) => setConfirmName(e.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+          />
+
+          {error && (
+            <div className="form-banner form-banner--error">
+              <AlertIcon width={15} height={15} />
+              {error}
+            </div>
+          )}
+
+          <div className="settings-danger-actions">
+            <button
+              type="submit"
+              className="settings-button settings-button--danger"
+              disabled={deleting || !password || !nameMatches || (user.totpEnabled && code.trim().length === 0)}
+            >
+              {deleting && <SpinnerIcon width={15} height={15} />}
+              Удалить навсегда
+            </button>
+            <button type="button" className="settings-button" onClick={close} disabled={deleting}>
+              Отмена
+            </button>
+          </div>
+        </form>
+      )}
+    </section>
+  )
+}
+
 function TwoFactorSettings({ user, onChanged }: { user: User; onChanged: () => void }) {
   const [step, setStep] = useState<'idle' | 'enrolling' | 'backup-codes' | 'disabling'>('idle')
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
@@ -638,6 +764,8 @@ export function SettingsPanel({
   preferences,
   onUpdatePreferences,
   onResetPreferences,
+  onAccountDeleted,
+  onOpenPrivacy,
   onUpdateProfile,
   onChangePassword,
   onRequestEmailVerification,
@@ -777,15 +905,26 @@ export function SettingsPanel({
     setProfileMessage(null)
     if (!enabled) {
       onUpdatePreferences({ notifications: false })
+      void disablePush()
       return
     }
-    if (!('Notification' in window)) {
-      setProfileMessage({ text: 'Этот браузер не поддерживает системные уведомления', error: true })
-      return
+    // Одна кнопка на оба транспорта: в браузере это разрешение Notification и
+    // подписка Web Push, в приложении — разрешение iOS и токен APNs. Проверять
+    // здесь `'Notification' in window` нельзя: в WKWebView этого API нет вовсе,
+    // и нативная сборка получала бы «браузер не поддерживает уведомления».
+    const result = await enablePush({
+      preview: preferences.messagePreview,
+      directEnabled: preferences.directNotifications,
+      groupEnabled: preferences.groupNotifications,
+    })
+    onUpdatePreferences({ notifications: result === 'granted' || result === 'unconfigured' })
+    if (result === 'denied') {
+      setProfileMessage({ text: 'Разрешите уведомления в настройках системы', error: true })
+    } else if (result === 'unconfigured') {
+      setProfileMessage({ text: 'Уведомления включены, но приходить будут только при открытом приложении: пуши на сервере не настроены', error: false })
+    } else if (result === 'unsupported') {
+      setProfileMessage({ text: 'Это устройство не поддерживает уведомления', error: true })
     }
-    const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission
-    onUpdatePreferences({ notifications: permission === 'granted' })
-    if (permission !== 'granted') setProfileMessage({ text: 'Разрешите уведомления в настройках браузера', error: true })
   }
 
   async function handlePasswordSubmit(e: React.FormEvent) {
@@ -1258,11 +1397,12 @@ export function SettingsPanel({
                 <TwoFactorSettings user={user} onChanged={() => void onRefreshUser()} />
                 <SessionsSettings />
                 <section className="settings-card"><div className="settings-card-title"><h3>Смена пароля</h3><p>Не менее 10 символов и минимум три разных вида символов</p></div><form className="settings-password-form" onSubmit={handlePasswordSubmit}><label htmlFor="old-password">Текущий пароль</label><input id="old-password" type={showPasswords ? 'text' : 'password'} className="text-input" value={oldPassword} onChange={(e) => setOldPassword(e.target.value)} autoComplete="current-password" /><label htmlFor="new-password">Новый пароль</label><input id="new-password" type={showPasswords ? 'text' : 'password'} className="text-input" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoComplete="new-password" minLength={10} maxLength={128} /><label htmlFor="confirm-password">Повторите новый пароль</label><input id="confirm-password" type={showPasswords ? 'text' : 'password'} className="text-input" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} autoComplete="new-password" minLength={10} maxLength={128} /><label className="settings-checkbox-row"><input type="checkbox" checked={showPasswords} onChange={(e) => setShowPasswords(e.target.checked)} />Показать пароли</label>{passwordMessage && <div className={`form-banner ${passwordMessage.error ? 'form-banner--error' : 'form-banner--success'}`}>{passwordMessage.error && <AlertIcon width={15} height={15} />}{passwordMessage.text}</div>}<button type="submit" className="settings-button settings-button--primary" disabled={savingPassword || !oldPassword || !newPassword || !confirmPassword}>{savingPassword && <SpinnerIcon width={15} height={15} />}Сохранить пароль</button></form></section>
+                <DeleteAccountSettings user={user} onDeleted={onAccountDeleted} />
               </>
             )}
 
             {activeTab === 'about' && (
-              <><section className="settings-card settings-about"><span className="settings-about-logo">C</span><h3 className="notranslate" translate="no">CorNet</h3><p>Современный мессенджер с личными и групповыми чатами.</p><span className="settings-version">Версия 0.2 Beta</span></section><section className="settings-card settings-card--rows"><div className="settings-control-row"><span className="settings-control-copy"><strong>Сбросить настройки интерфейса</strong><small>Вернуть тему, размер текста и поведение чатов по умолчанию</small></span><button className="settings-button settings-button--ghost" onClick={onResetPreferences}>Сбросить</button></div></section></>
+              <><section className="settings-card settings-about"><span className="settings-about-logo">C</span><h3 className="notranslate" translate="no">CorNet</h3><p>Современный мессенджер с личными и групповыми чатами.</p><span className="settings-version">Версия 0.2 Beta</span></section><section className="settings-card settings-card--rows"><div className="settings-control-row"><span className="settings-control-copy"><strong>Политика конфиденциальности</strong><small>Что именно хранится, кому передаётся и сколько живёт</small></span><button className="settings-button settings-button--ghost" onClick={onOpenPrivacy}>Открыть</button></div><div className="settings-control-row"><span className="settings-control-copy"><strong>Сбросить настройки интерфейса</strong><small>Вернуть тему, размер текста и поведение чатов по умолчанию</small></span><button className="settings-button settings-button--ghost" onClick={onResetPreferences}>Сбросить</button></div></section></>
             )}
           </div>
         </main>

@@ -1,16 +1,21 @@
 import { memo, useEffect, useRef, useState } from 'react'
-import type { Chat, User } from '../types'
+import type { Chat, ChatFolder, User } from '../types'
 import type { ConnectionStatus } from '../api/socket'
 import { searchUsers } from '../api/client'
 import { callMessageSummary } from '../utils/calls'
+import { stripFormatting } from '../utils/markup'
 import { AvatarImage } from './AvatarImage'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { useContextMenu } from '../hooks/useContextMenu'
 import { useEscapeToClose } from '../hooks/useEscapeToClose'
 import type { RailView } from './LeftRail'
 import {
+  ArchiveIcon,
+  BellIcon,
+  BellOffIcon,
   BookmarkIcon,
   CloseIcon,
+  FolderIcon,
   InboxIcon,
   LogoutIcon,
   PinIcon,
@@ -35,7 +40,14 @@ interface SidebarProps {
   onOpenSettings: () => void
   onLogout: () => void
   onTogglePinned: (chatId: number, pinned: boolean) => void
+  folders: ChatFolder[]
+  onToggleArchived: (chatId: number, archived: boolean) => void
+  onToggleMuted: (chatId: number, mutedUntil: number | null) => void
+  onManageFolders: () => void
 }
+
+/** «Навсегда» — дата далеко в будущем, отдельного флага не заводим. */
+const MUTE_FOREVER = 8640000000000000
 
 function formatTime(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -57,7 +69,16 @@ function previewText(chat: Chat, currentUserId: number) {
   if (last.type === 'voice') return `${prefix}Голосовое сообщение`
   if (last.type === 'audio') return `${prefix}Аудио`
   if (last.type === 'file') return `${prefix}${last.attachment?.name || 'Файл'}`
-  return `${prefix}${last.text}`
+  if (last.type === 'poll') return `${prefix}📊 ${last.poll?.question ?? 'Опрос'}`
+  // У зашифрованного сообщения серверный `text` пуст, поэтому берём
+  // расшифрованный на клиенте. Пока расшифровка не дошла — показываем замок,
+  // а не пустую строку.
+  if (last.encrypted) {
+    if (last.decryptedText === undefined) return `${prefix}🔒 Зашифрованное сообщение`
+    return `${prefix}${stripFormatting(last.decryptedText)}`
+  }
+  // Маркеры разметки в превью не нужны — показываем чистый текст.
+  return `${prefix}${stripFormatting(last.text)}`
 }
 
 const ChatListRow = memo(function ChatListRow({
@@ -105,6 +126,7 @@ const ChatListRow = memo(function ChatListRow({
             <span className="chat-name">
               {chat.pinned && !isSaved && <PinIcon width={11} height={11} className="chat-pin-indicator" />}
               {chat.name}
+              {chat.mutedUntil && <BellOffIcon width={11} height={11} className="chat-muted-icon" />}
             </span>
             {last && <span className="chat-time">{formatTime(last.createdAt)}</span>}
           </span>
@@ -139,6 +161,7 @@ const RAIL_LABELS: Record<RailView, string> = {
   direct: 'Личные сообщения',
   group: 'Группы',
   saved: 'Избранное',
+  archive: 'Архив',
 }
 
 export function Sidebar({
@@ -156,7 +179,18 @@ export function Sidebar({
   onOpenSettings,
   onLogout,
   onTogglePinned,
+  folders,
+  onToggleArchived,
+  onToggleMuted,
+  onManageFolders,
 }: SidebarProps) {
+  const [activeFolderId, setActiveFolderId] = useState<number | null>(null)
+  // Папка перекрывает раздел при фильтрации, поэтому при переключении раздела
+  // её надо сбросить — иначе клик по «Группы» внешне не давал бы никакого
+  // эффекта, список продолжал бы показывать содержимое папки.
+  useEffect(() => {
+    setActiveFolderId(null)
+  }, [railView])
   const [filter, setFilter] = useState('')
   const [filterUsers, setFilterUsers] = useState<User[]>([])
   const [filterSearching, setFilterSearching] = useState(false)
@@ -270,12 +304,28 @@ export function Sidebar({
         icon: <PinIcon width={15} height={15} />,
         onClick: () => onTogglePinned(chat.id, !chat.pinned),
       })
+      items.push({
+        label: chat.mutedUntil ? 'Включить уведомления' : 'Отключить уведомления',
+        icon: chat.mutedUntil ? <BellIcon width={15} height={15} /> : <BellOffIcon width={15} height={15} />,
+        onClick: () => onToggleMuted(chat.id, chat.mutedUntil ? null : MUTE_FOREVER),
+      })
+      items.push({
+        label: chat.archived ? 'Вернуть из архива' : 'В архив',
+        icon: <ArchiveIcon width={15} height={15} />,
+        onClick: () => onToggleArchived(chat.id, !chat.archived),
+      })
     }
     if (items.length === 0) return
     openFromMouseEvent(event, items)
   }
 
+  const activeFolder = folders.find((f) => f.id === activeFolderId) ?? null
   const scopedChats = chats.filter((c) => {
+    // Архив — отдельный раздел: в обычных вкладках архивные чаты не показываем,
+    // иначе «убрать в архив» ничего бы визуально не меняло.
+    if (railView === 'archive') return c.archived
+    if (c.archived) return false
+    if (activeFolder) return activeFolder.chatIds.includes(c.id)
     if (railView === 'all') return true
     if (railView === 'saved') return c.type === 'saved'
     return c.type === railView
@@ -328,7 +378,45 @@ export function Sidebar({
         </button>
       </div>
 
-      <div className="sidebar__section-label">{RAIL_LABELS[railView]}</div>
+      <div className="sidebar__section-label">
+        {activeFolder ? activeFolder.name : RAIL_LABELS[railView]}
+      </div>
+
+      {/* Вкладки папок прячем в архиве: там свой самостоятельный список. */}
+      {railView !== 'archive' && (
+        <div className="folder-tabs" role="tablist" aria-label="Папки">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeFolderId === null}
+            className={`folder-tab${activeFolderId === null ? ' is-active' : ''}`}
+            onClick={() => setActiveFolderId(null)}
+          >
+            Все
+          </button>
+          {folders.map((folder) => {
+            const unread = chats
+              .filter((c) => folder.chatIds.includes(c.id) && !c.archived && !c.mutedUntil)
+              .reduce((sum, c) => sum + c.unreadCount, 0)
+            return (
+              <button
+                key={folder.id}
+                type="button"
+                role="tab"
+                aria-selected={activeFolderId === folder.id}
+                className={`folder-tab${activeFolderId === folder.id ? ' is-active' : ''}`}
+                onClick={() => setActiveFolderId(folder.id)}
+              >
+                {folder.name}
+                {unread > 0 && <span className="folder-tab__badge">{unread}</span>}
+              </button>
+            )
+          })}
+          <button type="button" className="folder-tab folder-tab--manage" onClick={onManageFolders} title="Настроить папки">
+            <FolderIcon width={13} height={13} />
+          </button>
+        </div>
+      )}
 
       {showNewChat && (
         <div className="new-chat-panel">

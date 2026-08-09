@@ -9,6 +9,7 @@ interface AuthScreenProps {
   pendingTwoFactor: boolean
   onVerifyTwoFactor: (code: string) => Promise<void>
   onCancelTwoFactor: () => void
+  onOpenPrivacy: () => void
 }
 
 function TwoFactorForm({ error, onVerify, onCancel }: {
@@ -141,7 +142,7 @@ function ForgotPasswordForm({ onBack }: { onBack: () => void }) {
   )
 }
 
-export function AuthScreen({ error, onLogin, onRegister, pendingTwoFactor, onVerifyTwoFactor, onCancelTwoFactor }: AuthScreenProps) {
+export function AuthScreen({ error, onLogin, onRegister, pendingTwoFactor, onVerifyTwoFactor, onCancelTwoFactor, onOpenPrivacy }: AuthScreenProps) {
   const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -290,6 +291,11 @@ export function AuthScreen({ error, onLogin, onRegister, pendingTwoFactor, onVer
           onClick={() => switchMode(mode === 'login' ? 'register' : 'login')}
         >
           {mode === 'login' ? 'Нет аккаунта? Создать' : 'Уже есть аккаунт? Войти'}
+        </button>
+
+        {/* До регистрации, а не после: человек должен видеть, на что соглашается. */}
+        <button type="button" className="auth-privacy-link" onClick={onOpenPrivacy}>
+          Политика конфиденциальности
         </button>
       </form>
     </div>

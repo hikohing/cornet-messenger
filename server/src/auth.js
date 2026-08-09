@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import { promisify } from 'node:util'
 import * as OTPAuth from 'otpauth'
-import { one, run, many } from './db.js'
+import { one, run, many, withTransaction } from './db.js'
 import { createSavedChat, isSafeAttachmentUrl } from './chats.js'
 import { appError } from './errors.js'
 import { sendPasswordResetEmail, sendVerificationEmail, sendSecurityAlert } from './mailer.js'
@@ -410,6 +410,86 @@ export async function changePassword(userId, oldPassword, newPassword, userAgent
   await run('DELETE FROM sessions WHERE user_id = $1', [userId])
   clearLoginFailures(user.username)
   return createSession(userId, userAgent)
+}
+
+/**
+ * Полное удаление аккаунта — требование App Store (5.1.1v) и просто честное
+ * поведение: «удалить» должно означать удалить, а не отключить.
+ *
+ * Что происходит:
+ *  - строка пользователя удаляется, и по внешним ключам с ней уходят сессии,
+ *    сообщения, реакции, голоса в опросах, ключи шифрования, папки, блокировки
+ *    и зарегистрированные устройства для пушей;
+ *  - личные чаты удаляются целиком: переписка один на один без одной стороны
+ *    нерабочая — писать в неё некому, а сообщения ушедшего и так исчезли;
+ *  - группы остаются жить, но если участников не осталось — удаляются;
+ *  - закреплённые сообщения, указывавшие на удалённые, отцепляются.
+ *
+ * Всё одной транзакцией: аккаунт, удалённый наполовину, хуже неудалённого.
+ *
+ * @returns {Promise<{ files: string[], removedChats: Array<{ chatId: number, memberIds: number[] }>, groupChatIds: number[] }>}
+ *   files — что убрать с диска; removedChats и groupChatIds — кому разослать
+ *   обновления, чтобы у собеседников не осталось чата-призрака до перезагрузки.
+ */
+export async function deleteAccount(userId, password, totpCode) {
+  const user = await one('SELECT * FROM users WHERE id = $1', [userId])
+  if (!user) throw appError('Аккаунт не найден', 404)
+  if (!(await verifyPassword(typeof password === 'string' ? password : '', user.password_hash))) {
+    throw appError('Неверный пароль', 401, 'INVALID_PASSWORD')
+  }
+  // Пароль мог утечь — если человек включил второй фактор, для необратимого
+  // действия он тем более обязателен.
+  if (user.totp_enabled && !(await verifyTotpOrBackupCode(userId, totpCode))) {
+    throw appError('Неверный код', 401, 'INVALID_TOTP')
+  }
+
+  const files = await many(
+    `SELECT attachment_url AS url FROM messages WHERE sender_id = $1 AND attachment_url IS NOT NULL
+     UNION
+     SELECT avatar_url FROM users WHERE id = $1 AND avatar_url IS NOT NULL
+     UNION
+     SELECT banner_url FROM users WHERE id = $1 AND banner_url IS NOT NULL`,
+    [userId],
+  )
+
+  // Собираем до удаления: после транзакции этих чатов уже не существует, а
+  // собеседникам надо сказать, что чат пропал.
+  const removedChatRows = await many(
+    `SELECT c.id AS chat_id,
+            ARRAY(SELECT user_id FROM chat_members WHERE chat_id = c.id AND user_id <> $1) AS member_ids
+       FROM chats c
+       JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1
+      WHERE c.type <> 'group'`,
+    [userId],
+  )
+  const groupChatRows = await many(
+    `SELECT c.id FROM chats c JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1 WHERE c.type = 'group'`,
+    [userId],
+  )
+
+  await withTransaction(async (client) => {
+    await client.query(
+      `DELETE FROM chats WHERE type <> 'group' AND id IN (SELECT chat_id FROM chat_members WHERE user_id = $1)`,
+      [userId],
+    )
+    await client.query('DELETE FROM users WHERE id = $1', [userId])
+    // Группа, из которой ушёл последний участник, никому уже не принадлежит.
+    await client.query('DELETE FROM chats WHERE NOT EXISTS (SELECT 1 FROM chat_members WHERE chat_members.chat_id = chats.id)')
+    // pinned_message_id — обычная колонка без внешнего ключа, поэтому после
+    // каскадного удаления сообщений она могла остаться висеть в пустоту.
+    await client.query(
+      `UPDATE chats SET pinned_message_id = NULL
+        WHERE pinned_message_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = chats.pinned_message_id)`,
+    )
+  })
+
+  audit('account.deleted', { userId, username: user.username })
+  return {
+    files: files.map((row) => row.url).filter((url) => isSafeAttachmentUrl(url)),
+    removedChats: removedChatRows.map((row) => ({ chatId: row.chat_id, memberIds: row.member_ids ?? [] })),
+    groupChatIds: groupChatRows.map((row) => row.id),
+  }
 }
 
 export async function touchLastSeen(userId) {

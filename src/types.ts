@@ -60,13 +60,65 @@ export interface MessageAttachment {
   size: number
   duration?: number
   messageType: AttachmentMessageType
+  /**
+   * Только на клиенте: ключ от зашифрованного файла. Не уходит на сервер как
+   * поле вложения — его место внутри конверта сообщения, зашифрованного для
+   * получателя.
+   */
+  secret?: { key: string; iv: string }
+}
+
+/** Вложение после расшифровки конверта: то, чего сервер о файле не знает. */
+export interface DecryptedAttachment {
+  key: string
+  iv: string
+  name: string
+  mimeType: string
+  size: number
+  duration?: number
+  messageType: AttachmentMessageType
+}
+
+export interface MessageEncryptionData {
+  version: 1
+  ciphertext: string
+  iv: string
+  signature: string
+  senderId: number
+  ephemeralPublicKey?: JsonWebKey
+  /** Same plaintext, separately encrypted to the sender's own public key so they can read it back after reload. */
+  self?: {
+    ciphertext: string
+    iv: string
+    ephemeralPublicKey: JsonWebKey
+  }
+}
+
+export interface PollOption {
+  id: number
+  text: string
+  votes: number
+  /** Отдал ли текущий пользователь голос за этот вариант. */
+  chosen: boolean
+  /** В анонимном опросе всегда null — сервер не отдаёт список голосовавших. */
+  voterIds: number[] | null
+}
+
+export interface Poll {
+  messageId: number
+  question: string
+  anonymous: boolean
+  multipleChoice: boolean
+  closed: boolean
+  totalVoters: number
+  options: PollOption[]
 }
 
 export interface Message {
   id: number
   chatId: number
   senderId: number
-  type: 'text' | AttachmentMessageType | 'call'
+  type: 'text' | AttachmentMessageType | 'call' | 'poll'
   text: string
   callMeta?: CallMeta | null
   attachmentUrl?: string | null
@@ -79,6 +131,25 @@ export interface Message {
   createdAt: number
   reactions?: Reaction[]
   pending?: boolean
+  /**
+   * Client-only stable identity that survives the optimistic → server-confirmed
+   * swap. Keying the list on the raw `id` would remount the row when the
+   * negative optimistic id is replaced by the real one, replaying the entry
+   * animation on every message you send.
+   */
+  clientKey?: number
+  encrypted?: boolean
+  encryptionData?: MessageEncryptionData | null
+  /** Заполнен только у сообщений типа `poll`. */
+  poll?: Poll | null
+  /** Client-only: filled in after local decryption, never sent by the server. */
+  decryptedText?: string
+  /**
+   * Настоящие имя, тип и ключ вложения — они лежат внутри конверта, поэтому
+   * появляются только после расшифровки. Серверу видны лишь непрозрачные байты.
+   */
+  decryptedFile?: DecryptedAttachment
+  decryptionFailed?: 'signature_invalid' | 'key_missing' | 'decrypt_failed'
 }
 
 export type ChatType = 'direct' | 'group' | 'saved'
@@ -100,4 +171,16 @@ export interface Chat {
   unreadCount: number
   pinnedMessage: Message | null
   pinned: boolean
+  archived: boolean
+  /** null — уведомления включены; иначе до какого момента чат беззвучный. */
+  mutedUntil: number | null
+  /** 0 — таймер выключен; иначе через сколько секунд сообщения исчезают. */
+  autoDeleteSeconds: number
+}
+
+export interface ChatFolder {
+  id: number
+  name: string
+  position: number
+  chatIds: number[]
 }
