@@ -47,8 +47,8 @@ import re, sys
 path = sys.argv[1]
 source = open(path, encoding='utf-8').read()
 
-if 'import CornetCallKit' not in source:
-    source = source.replace('import Capacitor', 'import Capacitor\nimport CornetCallKit', 1)
+if 'import CornetCallkit' not in source:
+    source = source.replace('import Capacitor', 'import Capacitor\nimport CornetCallkit', 1)
 
 anchor = re.search(r'(func application\([^)]*didFinishLaunchingWithOptions[^)]*\)\s*->\s*Bool\s*\{)', source, re.S)
 if not anchor:
