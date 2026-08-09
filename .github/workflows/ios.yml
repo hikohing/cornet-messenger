@@ -35,9 +35,24 @@ jobs:
       - name: Собрать веб-часть
         # Без этого адреса клиент пойдёт по относительным путям, а в WebView это
         # capacitor://localhost, где никакого сервера нет.
+        #
+        # Запасное значение обязательно: при запуске по пушу поля ввода пустые,
+        # и без него собиралось бы неработающее приложение — молча, потому что
+        # пустой VITE_API_URL это валидная сборка для веба.
         env:
-          VITE_API_URL: ${{ inputs.api_url }}
+          VITE_API_URL: ${{ inputs.api_url || 'https://web-messenger-production-3f4e.up.railway.app' }}
         run: npm run build
+
+      - name: Проверить, что адрес сервера попал в сборку
+        env:
+          VITE_API_URL: ${{ inputs.api_url || 'https://web-messenger-production-3f4e.up.railway.app' }}
+        run: |
+          HOST=$(echo "$VITE_API_URL" | sed -E 's#^https?://##; s#/.*##')
+          if ! grep -rqF "$HOST" dist/assets; then
+            echo "В собранном клиенте нет адреса $HOST — приложению некуда обращаться" >&2
+            exit 1
+          fi
+          echo "Адрес $HOST на месте"
 
       - name: Создать нативный проект
         run: npx cap add ios
