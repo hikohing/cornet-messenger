@@ -30,3 +30,7 @@ desktop/release
 
 # Нативный проект iOS генерируется Capacitor при сборке (см. .github/workflows/ios.yml)
 ios
+
+# Пароли боевого сервера
+deploy/.env
+deploy/data

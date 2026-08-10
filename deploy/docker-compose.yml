@@ -1,0 +1,81 @@
+# Развёртывание на своём сервере (Yandex Cloud или любая другая машина с Docker).
+#
+# Три контейнера: приложение, база и nginx с сертификатом Let's Encrypt.
+# Данные — база и загруженные файлы — лежат в томах на хосте, поэтому переживают
+# пересборку и обновление образа.
+#
+# Перед первым запуском скопируйте .env.example в .env и заполните.
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Наружу база не смотрит: только приложение из этой же сети.
+    expose:
+      - "5432"
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      PORT: 4000
+      NODE_ENV: production
+      APP_ORIGIN: https://${DOMAIN}
+      UPLOADS_DIR: /data/uploads
+      TOTP_ENC_KEY: ${TOTP_ENC_KEY}
+      MEDIA_TICKET_KEY: ${MEDIA_TICKET_KEY}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
+      VAPID_SUBJECT: ${VAPID_SUBJECT}
+      ALERT_EMAIL: ${ALERT_EMAIL}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      MAIL_FROM: ${MAIL_FROM}
+      DEFAULT_AUTO_DELETE_SECONDS: ${DEFAULT_AUTO_DELETE_SECONDS}
+      TURN_URLS: ${TURN_URLS}
+      TURN_USERNAME: ${TURN_USERNAME}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL}
+    volumes:
+      - ./data/uploads:/data/uploads
+    expose:
+      - "4000"
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+      - ./data/certbot/conf:/etc/letsencrypt:ro
+      - ./data/certbot/www:/var/www/certbot:ro
+    environment:
+      DOMAIN: ${DOMAIN}
+
+  # Разовое получение и последующее продление сертификата.
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ./data/certbot/conf:/etc/letsencrypt
+      - ./data/certbot/www:/var/www/certbot
+    # Проверяет дважды в сутки, продлевает за месяц до истечения.
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
