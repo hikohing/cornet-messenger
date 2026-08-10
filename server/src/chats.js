@@ -109,8 +109,9 @@ export async function getOrCreateDirectChat(userId, otherUsername) {
 
   if (await isBlockedEitherWay(userId, other.id)) throw appError('Нельзя начать переписку с этим пользователем')
 
-  const chat = await one("INSERT INTO chats (type, name, created_at) VALUES ('direct', NULL, $1) RETURNING id", [
+  const chat = await one("INSERT INTO chats (type, name, created_at, auto_delete_seconds) VALUES ('direct', NULL, $1, $2) RETURNING id", [
     Date.now(),
+    defaultAutoDeleteSeconds(),
   ])
   await run('INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2), ($1, $3)', [chat.id, userId, other.id])
   return { chat: await getChatForViewer(chat.id, userId), created: true }
@@ -127,9 +128,10 @@ export async function createGroupChat(creatorId, name, usernames) {
   }
   if (memberIds.size < 2) throw appError('Добавьте хотя бы одного участника')
 
-  const chat = await one("INSERT INTO chats (type, name, created_at) VALUES ('group', $1, $2) RETURNING id", [
+  const chat = await one("INSERT INTO chats (type, name, created_at, auto_delete_seconds) VALUES ('group', $1, $2, $3) RETURNING id", [
     trimmedName,
     Date.now(),
+    defaultAutoDeleteSeconds(),
   ])
   for (const id of memberIds) {
     await run('INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2)', [chat.id, id])
@@ -295,6 +297,20 @@ export async function searchMessages(chatId, query) {
 }
 
 /** Attachments may only reference files this server stored under /uploads. */
+/**
+ * Через сколько секунд после отправки сообщение исчезает в только что созданном
+ * чате. Ноль (по умолчанию) — таймер выключен, переписка хранится, пока её не
+ * удалят руками.
+ *
+ * Смысл переменной в том, что данных, которых на сервере нет, невозможно ни
+ * изъять, ни выдать. Включать стоит осознанно: сообщения будут пропадать у всех
+ * участников без предупреждения, и вернуть их будет неоткуда.
+ */
+function defaultAutoDeleteSeconds() {
+  const value = Number(process.env.DEFAULT_AUTO_DELETE_SECONDS)
+  return Number.isInteger(value) && value > 0 ? value : 0
+}
+
 export function isSafeAttachmentUrl(url) {
   return typeof url === 'string' && /^\/uploads\/[A-Za-z0-9._-]{1,120}$/.test(url) && !url.includes('..')
 }

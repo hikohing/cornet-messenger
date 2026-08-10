@@ -8347,15 +8347,38 @@
   -webkit-touch-callout: none;
 }
 
-/* Чёлка и «домашняя» полоска: интерфейс не должен под них уезжать. */
-[data-platform='ios'] .left-rail,
+/* Чёлка: интерфейс не должен под неё уезжать. */
 [data-platform='ios'] .sidebar__header,
 [data-platform='ios'] .chat-panel__header {
   padding-top: calc(var(--space-3) + env(safe-area-inset-top));
 }
 
-[data-platform='ios'] .left-rail {
-  padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+/* Только на широком экране .left-rail — вертикальная панель слева. На телефоне
+   это нижняя полоса навигации, и отступ под чёлку сверху оставлял бы в ней
+   пустое место, а отступ снизу складывался бы с тем, который там уже есть. */
+@media (min-width: 701px) {
+  [data-platform='ios'] .left-rail {
+    padding-top: calc(var(--space-3) + env(safe-area-inset-top));
+    padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  }
+}
+
+/* Экран входа: высота ровно в экран и центрирование флексом означают, что при
+   открытой клавиатуре карточка не помещается и её нижнюю часть — как раз поля
+   ввода — просто нечем прокрутить. */
+[data-platform='ios'] .auth-shell {
+  height: auto;
+  min-height: 100dvh;
+  /* Центрирование через margin, а не align-items: карточка выше экрана при
+     align-items: center обрезалась бы сверху, без возможности прокрутить. */
+  align-items: flex-start;
+  overflow-y: auto;
+  padding-top: calc(var(--space-4) + env(safe-area-inset-top));
+  padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom));
+}
+
+[data-platform='ios'] .auth-card {
+  margin: auto;
 }
 
 /* Поле ввода прижато к низу экрана: над домашней полоской, а когда открыта

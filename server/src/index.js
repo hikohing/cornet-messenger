@@ -54,6 +54,7 @@ import { audit } from './audit.js'
 import { sendSecurityAlert } from './mailer.js'
 import { blockUser, unblockUser, listBlockedByUser } from './blocking.js'
 import { createReport, reportReasons } from './reports.js'
+import { getGroupKeyState, publishGroupKey, invalidateGroupKey } from './groupKeys.js'
 import { issueMediaTicket, verifyMediaTicket } from './mediaTicket.js'
 import { NATIVE_ORIGINS } from './origins.js'
 import { registerDevice, unregisterDevice, removeDevicesForSession, removeDevicesForSessionHash, removeDevicesForUser } from './push.js'
@@ -687,6 +688,9 @@ app.post(
   asyncRoute(async (req, res) => {
     const chatId = Number(req.params.id)
     await leaveGroup(chatId, req.user.id)
+    // Ушедший знает действующий ключ группы, поэтому он объявляется устаревшим:
+    // новые сообщения будут зашифрованы поколением, до которого он не дотянется.
+    await invalidateGroupKey(chatId)
     await notifyChatUpdated(chatId)
     notifyChatLeft(req.user.id, chatId)
     res.json({ ok: true })
@@ -785,6 +789,23 @@ app.get(
       .filter((id) => Number.isInteger(id) && id > 0)
       .slice(0, 100)
     res.json({ keys: await getPublicKeyBundles(ids) })
+  }),
+)
+
+app.get(
+  '/api/chats/:id/group-key',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    res.json(await getGroupKeyState(Number(req.params.id), req.user.id))
+  }),
+)
+
+app.post(
+  '/api/chats/:id/group-key',
+  authMiddleware,
+  asyncRoute(async (req, res) => {
+    const { rotation, shares } = req.body ?? {}
+    res.json(await publishGroupKey(Number(req.params.id), req.user.id, Number(rotation), shares))
   }),
 )
 

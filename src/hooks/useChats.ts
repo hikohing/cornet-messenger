@@ -6,6 +6,7 @@ import { useCallSession } from './useCallSession'
 import type { AppPreferences } from './usePreferences'
 import { decryptIncoming, encryptOutgoing, ensureChatKeysLoaded } from '../crypto/session'
 import { ENCRYPTED_UPLOAD_MIME, ENCRYPTED_UPLOAD_NAME } from '../crypto/files'
+import { showToast } from './useToast'
 
 const TYPING_TIMEOUT_MS = 3000
 
@@ -408,6 +409,18 @@ export function useChats(
     const encrypted = chat && (trimmed || filePayload)
       ? await encryptOutgoing(chat, trimmed, currentUserIdRef.current, filePayload)
       : null
+
+    // Отправить незашифрованным то, что должно было уйти зашифрованным, хуже,
+    // чем не отправить вовсе: человек уверен, что переписку не прочитать, а
+    // она легла на сервер открытым текстом. Молчаливого отката быть не должно.
+    if (chat && !encrypted) {
+      showToast(
+        chat.type === 'group'
+          ? 'Не удалось зашифровать: у кого-то из участников нет ключей шифрования. Попросите их зайти в приложение.'
+          : 'Не удалось зашифровать сообщение — оно не отправлено',
+      )
+      return false
+    }
 
     // Серверу — только то, что ему нужно для хранения и раздачи файла. Имя и
     // тип обезличены: настоящие уехали внутри конверта.

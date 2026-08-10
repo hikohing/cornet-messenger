@@ -356,6 +356,30 @@ export function searchMessages(chatId: number, query: string) {
   return request<{ messages: Message[] }>(`/api/chats/${chatId}/search?query=${encodeURIComponent(query)}`)
 }
 
+export interface GroupKeyShare {
+  rotation: number
+  wrappedKey: string
+  iv: string
+  ephemeralPublicKey: JsonWebKey
+}
+
+export function getGroupKeyState(chatId: number) {
+  return request<{ rotation: number; nextRotation: number; shares: GroupKeyShare[]; memberIds: number[] }>(
+    `/api/chats/${chatId}/group-key`,
+  )
+}
+
+export function publishGroupKey(
+  chatId: number,
+  rotation: number,
+  shares: Array<{ userId: number; wrappedKey: string; iv: string; ephemeralPublicKey: JsonWebKey }>,
+) {
+  return request<{ accepted: boolean; rotation: number }>(`/api/chats/${chatId}/group-key`, {
+    method: 'POST',
+    body: JSON.stringify({ rotation, shares }),
+  })
+}
+
 export interface PushDeviceRegistration {
   /** `apns_voip` — токен PushKit для звонков; он не совпадает с обычным APNs-токеном. */
   provider: 'apns' | 'webpush' | 'apns_voip'

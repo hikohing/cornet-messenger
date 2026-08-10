@@ -81,6 +81,14 @@ function sanitizeEncryptionEnvelope(raw, senderId) {
     base.self = self
   }
 
+  // Групповое сообщение шифруется ключом поколения, а не одноразовым ECDH.
+  // Номер поколения нужен получателю, чтобы понять, какой из своих ключей брать:
+  // после ухода участника в одном чате сосуществуют сообщения разных поколений.
+  if (raw.rotation !== undefined) {
+    if (!Number.isInteger(raw.rotation) || raw.rotation < 1) return null
+    base.rotation = raw.rotation
+  }
+
   if (raw.ephemeralPublicKey !== undefined) {
     if (typeof raw.ephemeralPublicKey !== 'object' || raw.ephemeralPublicKey === null) return null
     return { ...base, ephemeralPublicKey: raw.ephemeralPublicKey }
@@ -390,7 +398,6 @@ export function attachWebSocket(httpServer) {
           // рассылка по сокетам не должна её ждать.
           void notifyNewMessage({ chatId, message, senderId: user.id, senderName: user.displayName || user.username })
             .catch((err) => audit('push.error', { userId: user.id, chatId, message: err?.message }))
-          audit('message.sent', { userId: user.id, username: user.username, chatId, messageId: message.id, messageType, hasAttachment: Boolean(attachmentUrl), encrypted })
           return
         }
 
@@ -404,7 +411,6 @@ export function attachWebSocket(httpServer) {
           const updated = await editMessage(messageId, user.id, text, encryptionData)
           if (!updated) return
           broadcastToUsers(await membersOf(updated.chatId), { type: 'message_edited', message: updated })
-          audit('message.edited', { userId: user.id, username: user.username, chatId: updated.chatId, messageId })
           return
         }
 
@@ -419,7 +425,6 @@ export function attachWebSocket(httpServer) {
             messageId: result.messageId,
             lastMessage: result.lastMessage,
           })
-          audit('message.deleted', { userId: user.id, username: user.username, chatId: result.chatId, messageId: result.messageId })
           return
         }
 
@@ -452,7 +457,6 @@ export function attachWebSocket(httpServer) {
             messageId: result.messageId,
             reactions: result.reactions,
           })
-          audit('message.reaction', { userId: user.id, username: user.username, chatId: result.chatId, messageId: result.messageId })
           return
         }
 
@@ -464,7 +468,6 @@ export function attachWebSocket(httpServer) {
           broadcastToUsers(await membersOf(targetChatId), { type: 'message', message })
           void notifyNewMessage({ chatId: targetChatId, message, senderId: user.id, senderName: user.displayName || user.username })
             .catch((err) => audit('push.error', { userId: user.id, chatId: targetChatId, message: err?.message }))
-          audit('message.forwarded', { userId: user.id, username: user.username, sourceMessageId, targetChatId, messageId: message.id })
           return
         }
 
@@ -474,7 +477,6 @@ export function attachWebSocket(httpServer) {
           await assertPollAllowed(chatId, user.id)
           const messageId = await createPoll(chatId, user.id, data.poll)
           await broadcastPollMessage(chatId, messageId, 'message')
-          audit('poll.created', { userId: user.id, username: user.username, chatId, messageId })
           return
         }
 
@@ -492,7 +494,6 @@ export function attachWebSocket(httpServer) {
           if (!messageId) return
           const chatId = await closePoll(messageId, user.id)
           await broadcastPollMessage(chatId, messageId, 'message_edited')
-          audit('poll.closed', { userId: user.id, username: user.username, chatId, messageId })
           return
         }
 
@@ -502,7 +503,6 @@ export function attachWebSocket(httpServer) {
           if (!chatId) return
           await pinMessage(chatId, user.id, messageId)
           broadcastToUsers(await membersOf(chatId), { type: 'pinned', chatId, messageId })
-          audit('message.pinned', { userId: user.id, username: user.username, chatId, messageId, unpinned: !messageId })
           return
         }
 
@@ -561,7 +561,6 @@ export function attachWebSocket(httpServer) {
               return
             }
           }
-          audit('call.started', { userId: user.id, username: user.username, chatId, targetUserId, video: Boolean(data.video), wakeNeeded })
           return
         }
 
@@ -585,7 +584,6 @@ export function attachWebSocket(httpServer) {
             sdp: claimed.offer,
           })
           for (const signal of claimed.signals) send(ws, signal)
-          audit('call.claimed', { userId: user.id, username: user.username, chatId: claimed.call.chatId })
           return
         }
 
@@ -595,7 +593,6 @@ export function attachWebSocket(httpServer) {
           const call = answerCall(callId, user.id, ws)
           if (!call) return
           send(call.callerSocket, { type: 'call_answer', callId, fromUserId: user.id, sdp: data.sdp })
-          audit('call.answered', { userId: user.id, username: user.username, chatId: call.chatId })
           return
         }
 
@@ -634,7 +631,6 @@ export function attachWebSocket(httpServer) {
           const call = getCall(callId)
           if (!callId || !isParticipant(call, user.id)) return
           await finishCall(callId, user.id, String(data.reason || 'hangup'))
-          audit('call.ended', { userId: user.id, username: user.username, chatId: call.chatId, reason: String(data.reason || 'hangup').slice(0, 32) })
           return
         }
       } catch (err) {

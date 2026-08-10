@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "postinstall": "cd server && npm install",
     "start": "node server/src/index.js",
-    "test": "node --test test/markup.test.ts test/crypto-keys.test.ts server/test/critical-path.test.js server/test/push.test.js server/test/calls-wake.test.js server/test/callkit.test.js server/test/account-deletion.test.js server/test/reports.test.js",
+    "test": "node --test test/markup.test.ts test/crypto-keys.test.ts server/test/critical-path.test.js server/test/push.test.js server/test/calls-wake.test.js server/test/callkit.test.js server/test/account-deletion.test.js server/test/reports.test.js server/test/group-keys.test.js",
     "test:unit": "node --test test/markup.test.ts test/crypto-keys.test.ts",
     "ios:add": "cap add ios",
     "ios:sync": "npm run build && cap sync ios",

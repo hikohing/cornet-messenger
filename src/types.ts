@@ -80,6 +80,12 @@ export interface DecryptedAttachment {
 }
 
 export interface MessageEncryptionData {
+  /**
+   * Поколение группового ключа. Есть только у групповых сообщений — по нему
+   * получатель понимает, какой из своих ключей брать: после ухода участника в
+   * чате сосуществуют сообщения разных поколений.
+   */
+  rotation?: number
   version: 1
   ciphertext: string
   iv: string
