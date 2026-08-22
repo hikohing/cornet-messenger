@@ -201,6 +201,17 @@ APNS_PRODUCTION=1
 приложения, а не грузятся с сервера — приложение открывается мгновенно и без сети.
 Собрать `.ipa` можно только на macOS с Xcode; всё остальное готовится на любой системе.
 
+### Минимальная версия — iOS 17.4
+
+Не вкусовщина и не запас на будущее: переписка шифруется X25519 и Ed25519 через
+WebCrypto, а WebKit получил их только в Safari 17.4. На более старой системе
+`crypto.subtle.generateKey` отвечает `NotSupportedError`, ключей у аккаунта не
+появляется — не отправляется и не читается ни одно сообщение. Поэтому
+`scripts/configure-ios.sh` поднимает `IPHONEOS_DEPLOYMENT_TARGET` до 17.4
+(шаблон Capacitor ставит 15.0): пусть система лучше не даст поставить
+приложение, чем поставит заведомо нерабочее. По той же причине десктопный
+клиент требует Electron 43 — в Chromium из Electron 33 этих алгоритмов ещё нет.
+
 ### Что уже сделано в коде
 
 - **Авторизация.** В WebView страница живёт на `capacitor://localhost`, и кука сессии
@@ -257,6 +268,75 @@ npm run ios:open
 - **Требования App Store к мессенджерам.** Блокировка пользователей и удаление аккаунта
   из приложения уже есть; для публикации остаётся политика конфиденциальности и механизм
   жалоб на контент (Guideline 1.2). Для сборки «для себя» не нужно.
+
+## Сборка приложения для Android (.apk)
+
+В отличие от iOS, APK собирается на любой ОС — Mac не нужен. Требуется JDK 21
+(Gradle 8.14 не запускается на JDK 8) и Android SDK с platform 36 / build-tools 36.
+
+```bash
+npm install
+VITE_API_URL=https://your-server.example npm run build
+npx cap add android          # один раз
+npm run android:apk
+```
+
+Готовый файл — `android/app/build/outputs/apk/release/app-release.apk`.
+`VITE_API_URL` так же обязателен, как и для iOS: без него WebView уходит
+на `capacitor://localhost`, где сервера нет.
+
+Если SDK лежит не там, где его ищет Gradle, путь задаётся в `android/local.properties`:
+
+```
+sdk.dir=C:/Users/you/tools/android-sdk
+```
+
+Слеши здесь именно прямые: в `.properties` обратный слеш — это escape-символ,
+и `C:Users...` Gradle прочитает как «синтаксическая ошибка в имени файла».
+
+### Подпись
+
+Ключ и пароли лежат в `android/keystore.properties` и `android/cornet-release.jks`,
+оба вне git. Без этого файла `assembleRelease` соберёт неподписанный APK, который
+Android откажется устанавливать. Создать ключ заново:
+
+```bash
+keytool -genkeypair -v -keystore android/cornet-release.jks -alias cornet   -keyalg RSA -keysize 4096 -validity 10000
+```
+
+**Keystore нельзя терять.** Обновление, подписанное другим ключом, не встанет
+поверх установленного приложения — только через удаление со всеми данными.
+
+### Разрешения
+
+В манифест добавлены `RECORD_AUDIO`, `CAMERA` и `MODIFY_AUDIO_SETTINGS`: без них
+`getUserMedia` внутри WebView отдаёт `NotAllowedError` и звонки не начинаются,
+даже если пользователь ни разу не видел системного запроса. `POST_NOTIFICATIONS`
+нужен с Android 13 — иначе уведомления молча не показываются.
+`android.hardware.camera` объявлена как `required="false"`, чтобы приложение не
+пропало из выдачи Play на планшетах без камеры.
+
+### Минимальная версия — это версия WebView, а не Android
+
+В `variables.gradle` стоит `minSdkVersion 24`, но ориентироваться на него нельзя.
+Шифрование переписки живёт в WebView, а X25519 появился в Chromium 133 и Ed25519 —
+в 137. Значит, рабочий пол это **Android System WebView 137+**, и он не связан с
+версией системы: WebView обновляется отдельно через Play. На устройстве со старым
+или замороженным WebView (китайские прошивки без сервисов Google, корпоративные
+образы) приложение запустится, но покажет баннер `.crypto-banner` вместо чатов.
+
+Поднимать `minSdkVersion` смысла нет — свежий Android не гарантирует свежий WebView,
+а старый не запрещает его.
+
+### Чего в Android-сборке нет
+
+- **Пуши.** `@capacitor/push-notifications` на Android работает через FCM, а значит
+  нужен `android/app/google-services.json` из проекта Firebase. Пока файла нет,
+  плагин собирается, но токен не выдаётся — сообщения приходят только когда
+  приложение открыто. Серверная часть под FCM тоже не написана: `server/src/push`
+  умеет APNs и Web Push.
+- **Звонки при закрытом приложении.** CallKit/PushKit — это iOS. Android-аналог
+  (ConnectionService + FCM high-priority) в `native-plugins/` не реализован.
 
 ## Звонки при закрытом приложении (CallKit + PushKit)
 

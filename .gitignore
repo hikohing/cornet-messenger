@@ -34,3 +34,11 @@ ios
 # Пароли боевого сервера
 deploy/.env
 deploy/data
+
+# Android: ключ подписи и пароли к нему не должны попадать в репозиторий
+android/cornet-release.jks
+android/keystore.properties
+android/local.properties
+android/build/
+android/app/build/
+android/.gradle/
