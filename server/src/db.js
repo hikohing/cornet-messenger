@@ -239,6 +239,9 @@ export async function initSchema() {
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_meta JSONB;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS encrypted BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS encryption_data JSONB;
+    -- Метка альбома: несколько снимков, отправленных одним действием, остаются
+    -- отдельными сообщениями, но клиент собирает их в одну сетку по этой метке.
+    ALTER TABLE messages ADD COLUMN IF NOT EXISTS album_id TEXT;
 
     CREATE TABLE IF NOT EXISTS public_keys (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

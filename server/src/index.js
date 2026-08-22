@@ -242,6 +242,18 @@ function sessionPayload(req, session) {
   return isNativeClient(req) ? { user: session.user, token: session.token } : { user: session.user }
 }
 
+/**
+ * Новая сессия могла вытеснить самую старую по лимиту на аккаунт. Строки в базе
+ * уже нет, но её сокет продолжал бы слать и принимать события, а
+ * зарегистрированное на неё устройство — получать пуши. Убираем и то, и другое.
+ */
+async function dropEvictedSessions(session) {
+  for (const hash of session?.evictedSessionHashes ?? []) {
+    disconnectSessionByHash(hash)
+    await removeDevicesForSessionHash(hash)
+  }
+}
+
 function clearSessionCookie(req, res) {
   const attributes = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0']
   if (isSecureRequest(req)) attributes.push('Secure')
@@ -356,6 +368,7 @@ app.post(
     const { username, password } = req.body
     const session = await register(username ?? '', password ?? '', req.headers['user-agent'])
     req.auditUser = session.user
+    await dropEvictedSessions(session)
     setSessionCookie(req, res, session.token)
     res.status(201).json(sessionPayload(req, session))
   }),
@@ -372,6 +385,7 @@ app.post(
       return
     }
     req.auditUser = session.user
+    await dropEvictedSessions(session)
     setSessionCookie(req, res, session.token)
     res.json(sessionPayload(req, session))
   }),
@@ -384,6 +398,7 @@ app.post(
     const { pendingToken, code } = req.body ?? {}
     const session = await verifyTwoFactorLogin(pendingToken ?? '', code ?? '', req.headers['user-agent'])
     req.auditUser = session.user
+    await dropEvictedSessions(session)
     setSessionCookie(req, res, session.token)
     res.json(sessionPayload(req, session))
   }),
@@ -573,6 +588,12 @@ app.post(
   sensitiveActionLimiter,
   asyncRoute(async (req, res) => {
     const session = await resetPasswordWithToken(req.body?.token ?? '', req.body?.newPassword ?? '', req.headers['user-agent'])
+    // Сброс пароля — это флоу «аккаунт увели». Строки сессий удаляет сам
+    // resetPasswordWithToken, но без этих двух шагов открытый сокет чужого
+    // устройства продолжал бы получать сообщения, а его пуш-подписка — превью
+    // переписки. Раньше так делала только смена пароля, а сброс — нет.
+    disconnectUser(session.user.id)
+    await removeDevicesForUser(session.user.id)
     setSessionCookie(req, res, session.token)
     res.json(sessionPayload(req, session))
   }),

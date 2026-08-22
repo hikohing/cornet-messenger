@@ -325,24 +325,78 @@ export function getBlockedUsers() {
  * @param name имя, под которым файл уедет на сервер. У зашифрованных вложений
  *   оно намеренно обезличено — настоящее хранится внутри конверта сообщения.
  */
-export async function uploadFile(file: Blob, name?: string): Promise<Omit<MessageAttachment, 'messageType'>> {
+export interface UploadOptions {
+  /** Доля отправленных байтов, 0…1. Вызывается по мере отправки тела запроса. */
+  onProgress?: (fraction: number) => void
+  /** Отмена: пользователь убрал вложение из панели, пока оно грузилось. */
+  signal?: AbortSignal
+}
+
+/** Отменённая пользователем загрузка — не ошибка, её не показывают в интерфейсе. */
+export class UploadAbortedError extends Error {
+  constructor() {
+    super('Загрузка отменена')
+    this.name = 'UploadAbortedError'
+  }
+}
+
+/**
+ * XMLHttpRequest, а не fetch: только он даёт прогресс отправки тела. Без него
+ * загрузка 25 МБ выглядит как зависшая кнопка, и человек жмёт её повторно.
+ */
+export function uploadFile(
+  file: Blob,
+  name?: string,
+  options: UploadOptions = {},
+): Promise<Omit<MessageAttachment, 'messageType'>> {
   const token = getToken()
   const form = new FormData()
   form.append('file', file, name ?? (file instanceof File ? file.name : 'file'))
-  let res: Response
-  try {
-    res = await fetch(`${API_URL}/api/upload`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { ...clientHeaders(), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: form,
-    })
-  } catch {
-    throw new Error('Нет соединения с сервером. Обновите страницу и попробуйте снова.')
-  }
-  const data = await res.json()
-  if (!res.ok) throw new Error(data.error ?? 'Ошибка загрузки')
-  return data
+
+  return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new UploadAbortedError())
+      return
+    }
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API_URL}/api/upload`)
+    xhr.withCredentials = true
+    for (const [header, value] of Object.entries(clientHeaders())) xhr.setRequestHeader(header, value)
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+
+    const onAbort = () => xhr.abort()
+    options.signal?.addEventListener('abort', onAbort)
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return
+      options.onProgress?.(event.loaded / event.total)
+    }
+    xhr.onload = () => {
+      options.signal?.removeEventListener('abort', onAbort)
+      let data: { error?: string } & Record<string, unknown>
+      try {
+        data = JSON.parse(xhr.responseText)
+      } catch {
+        reject(new Error('Ошибка загрузки'))
+        return
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(data.error ?? 'Ошибка загрузки'))
+        return
+      }
+      options.onProgress?.(1)
+      resolve(data as unknown as Omit<MessageAttachment, 'messageType'>)
+    }
+    xhr.onerror = () => {
+      options.signal?.removeEventListener('abort', onAbort)
+      reject(new Error('Нет соединения с сервером. Обновите страницу и попробуйте снова.'))
+    }
+    xhr.onabort = () => {
+      options.signal?.removeEventListener('abort', onAbort)
+      reject(new UploadAbortedError())
+    }
+    xhr.send(form)
+  })
 }
 
 export function pinChat(chatId: number, pinned: boolean) {

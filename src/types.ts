@@ -59,6 +59,12 @@ export interface MessageAttachment {
   mimeType: string
   size: number
   duration?: number
+  /**
+   * Размеры кадра у фото и видео. Нужны, чтобы место под медиа было занято до
+   * загрузки байтов: иначе лента дёргается, когда картинка наконец приходит.
+   */
+  width?: number
+  height?: number
   messageType: AttachmentMessageType
   /**
    * Только на клиенте: ключ от зашифрованного файла. Не уходит на сервер как
@@ -76,6 +82,8 @@ export interface DecryptedAttachment {
   mimeType: string
   size: number
   duration?: number
+  width?: number
+  height?: number
   messageType: AttachmentMessageType
 }
 

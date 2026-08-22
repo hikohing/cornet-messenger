@@ -11,7 +11,9 @@ import { isEncryptable } from '../crypto/session'
 import { PollMessage } from './PollMessage'
 import { CreatePollModal } from './CreatePollModal'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
-import { uploadFile } from '../api/client'
+import { uploadFile, UploadAbortedError } from '../api/client'
+import type { MediaViewerTarget } from './MessageMedia'
+import { formatFileSize, formatMediaDuration, grabVideoFrame, probeMediaFile } from '../utils/media'
 import type { ConnectionStatus } from '../api/socket'
 import { useEscapeToClose } from '../hooks/useEscapeToClose'
 import { toggleMarker, type MarkKind } from '../utils/markup'
@@ -122,6 +124,27 @@ interface ChatWindowProps {
 const GROUP_WINDOW_MS = 5 * 60 * 1000
 const TYPING_THROTTLE_MS = 1500
 
+/** Столько же принимает сервер: больше отдавать бессмысленно, откажет на загрузке. */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+const MAX_QUEUED_FILES = 10
+const SIZE_ERROR = 'Файл слишком большой (максимум 25 МБ)'
+const OFFLINE_ERROR = 'Нет соединения. Повторите отправку после подключения.'
+
+/** Файл, выбранный к отправке, но ещё лежащий в панели вложений. */
+interface PendingAttachment {
+  id: number
+  file: File
+  messageType: AttachmentMessageType
+  /** blob: для картинки, data-URL кадра для видео, null для остального. */
+  previewUrl: string | null
+  width?: number
+  height?: number
+  duration?: number
+  /** Доля отправленных байтов, 0…1. */
+  progress: number
+  uploading: boolean
+}
+
 function dayLabel(timestamp: number) {
   const date = new Date(timestamp)
   const today = new Date()
@@ -211,9 +234,16 @@ export function ChatWindow({
   const [isRecording, setIsRecording] = useState(false)
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [showComposerEmoji, setShowComposerEmoji] = useState(false)
-  const [lightboxImage, setLightboxImage] = useState<{ url: string; name: string } | null>(null)
+  const [lightboxMedia, setLightboxMedia] = useState<MediaViewerTarget | null>(null)
   const [isDraggingFile, setIsDraggingFile] = useState(false)
+  const [pendingFiles, setPendingFiles] = useState<PendingAttachment[]>([])
   const dragCounterRef = useRef(0)
+  const nextPendingIdRef = useRef(1)
+  const uploadAbortsRef = useRef(new Map<number, AbortController>())
+  // Очередь читается из обработчиков отправки, которые пережили ре-рендер:
+  // состояние там было бы тем, каким его увидела предыдущая версия функции.
+  const pendingFilesRef = useRef<PendingAttachment[]>(pendingFiles)
+  pendingFilesRef.current = pendingFiles
   const {
     menu: selectionContextMenu,
     openFromMouseEvent: openSelectionContextMenu,
@@ -324,6 +354,10 @@ export function ChatWindow({
 
   useEffect(() => () => {
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
+    for (const controller of uploadAbortsRef.current.values()) controller.abort()
+    for (const entry of pendingFilesRef.current) {
+      if (entry.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(entry.previewUrl)
+    }
     cancelRecordingRef.current = true
     if (recordingTimerRef.current) clearInterval(recordingTimerRef.current)
     if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
@@ -394,6 +428,9 @@ export function ChatWindow({
 
   useEffect(() => {
     if (recorderRef.current?.state === 'recording') finishRecording(true)
+    // Выбранные вложения принадлежат тому чату, где их выбрали: уносить их
+    // в следующий открытый чат — верный способ отправить не туда.
+    clearPendingFiles()
     setReplyingTo(null)
     setSelectedMessageIds(new Set())
     setForwardingMessages(null)
@@ -444,8 +481,15 @@ export function ChatWindow({
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!draft.trim()) return
+    if (uploading) return
     const text = draft
+    // Есть вложения — текст уходит их подписью, а не отдельным сообщением.
+    if (pendingFilesRef.current.length) {
+      setDraft('')
+      await sendPendingFiles(text.trim())
+      return
+    }
+    if (!text.trim()) return
     setDraft('')
     setReplyingTo(null)
     if (!(await onSend(text, undefined, replyingTo?.id))) {
@@ -493,56 +537,181 @@ export function ChatWindow({
     return 'file'
   }
 
+  /**
+   * Загрузить и отправить файл одним действием — путь голосовых: там нечего
+   * подписывать и нечего откладывать, запись уходит сразу после остановки.
+   */
   async function uploadAndSend(file: File, messageType = messageTypeForFile(file), duration?: number) {
     setUploadError('')
-    if (file.size > 25 * 1024 * 1024) {
-      setUploadError('Файл слишком большой (максимум 25 МБ)')
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      setUploadError(SIZE_ERROR)
       return
     }
     setUploading(true)
     try {
-      // В зашифрованном чате на сервер уезжает шифротекст под обезличенным
-      // именем: настоящие имя, тип и ключ поедут внутри конверта сообщения.
-      const encryptable = isEncryptable(chat, currentUserId)
-      const prepared = encryptable ? await encryptFile(file) : null
-      const res = prepared
-        ? await uploadFile(prepared.blob, ENCRYPTED_UPLOAD_NAME)
-        : await uploadFile(file)
-      const attachment = prepared
-        ? { ...res, name: file.name, mimeType: file.type || 'application/octet-stream', duration, messageType, secret: prepared.secret }
-        : { ...res, duration, messageType }
-      if (!(await onSend('', attachment, replyingTo?.id))) throw new Error('Нет соединения. Повторите отправку после подключения.')
+      const attachment = await prepareAttachment(file, { messageType, duration })
+      if (!(await onSend('', attachment, replyingTo?.id))) throw new Error(OFFLINE_ERROR)
       setReplyingTo(null)
     } catch (err) {
-      setUploadError((err as Error).message)
+      if (!(err instanceof UploadAbortedError)) setUploadError((err as Error).message)
     } finally {
       setUploading(false)
     }
   }
 
-  async function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    await uploadAndSend(file)
+  /**
+   * Шифрование (если чат зашифрован) и загрузка на сервер.
+   *
+   * В зашифрованном чате на сервер уезжает шифротекст под обезличенным именем:
+   * настоящие имя, тип и ключ поедут внутри конверта сообщения.
+   */
+  async function prepareAttachment(
+    file: File,
+    options: { messageType: AttachmentMessageType; duration?: number; width?: number; height?: number; signal?: AbortSignal; onProgress?: (fraction: number) => void },
+  ): Promise<MessageAttachment> {
+    const { messageType, duration, width, height, signal, onProgress } = options
+    const prepared = isEncryptable(chat, currentUserId) ? await encryptFile(file) : null
+    const uploadOptions = { signal, onProgress }
+    const res = prepared
+      ? await uploadFile(prepared.blob, ENCRYPTED_UPLOAD_NAME, uploadOptions)
+      : await uploadFile(file, undefined, uploadOptions)
+    return prepared
+      ? { ...res, name: file.name, mimeType: file.type || 'application/octet-stream', duration, width, height, messageType, secret: prepared.secret }
+      : { ...res, duration, width, height, messageType }
+  }
+
+  /**
+   * Положить файлы в панель вложений.
+   *
+   * Раньше выбранный файл улетал в чат мгновенно: ни подписать, ни передумать,
+   * ни отправить пару снимков разом было нельзя. Теперь файлы сначала попадают
+   * в панель над полем ввода — там видно превью, размер и крестик, а само поле
+   * ввода становится подписью.
+   */
+  async function queueFiles(files: File[]) {
+    if (!files.length) return
+    setUploadError('')
+    const room = MAX_QUEUED_FILES - pendingFilesRef.current.length
+    if (room <= 0) {
+      setUploadError(`За раз можно отправить не больше ${MAX_QUEUED_FILES} файлов`)
+      return
+    }
+    const accepted: PendingAttachment[] = []
+    let rejectedBySize = false
+    for (const file of files.slice(0, room)) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        rejectedBySize = true
+        continue
+      }
+      const messageType = messageTypeForFile(file)
+      accepted.push({
+        id: nextPendingIdRef.current++,
+        file,
+        messageType,
+        // Картинку показываем сразу по ссылке на сам файл; кадр из видео
+        // придётся сначала снять — он появится следующим обновлением.
+        previewUrl: messageType === 'image' ? URL.createObjectURL(file) : null,
+        progress: 0,
+        uploading: false,
+      })
+    }
+    if (rejectedBySize) setUploadError(SIZE_ERROR)
+    if (files.length > room) setUploadError(`За раз можно отправить не больше ${MAX_QUEUED_FILES} файлов`)
+    if (!accepted.length) return
+    setPendingFiles((prev) => [...prev, ...accepted])
+    composerRef.current?.focus()
+
+    // Размеры и кадр считаются асинхронно и догоняют плитку: ждать их до
+    // показа панели значило бы держать интерфейс пустым на ровном месте.
+    for (const item of accepted) {
+      void (async () => {
+        const probe = await probeMediaFile(item.file)
+        const preview = item.messageType === 'video' ? await grabVideoFrame(item.file) : null
+        setPendingFiles((prev) => prev.map((entry) => entry.id === item.id
+          ? { ...entry, ...probe, previewUrl: preview ?? entry.previewUrl }
+          : entry))
+      })()
+    }
+  }
+
+  function discardPendingFile(id: number) {
+    uploadAbortsRef.current.get(id)?.abort()
+    uploadAbortsRef.current.delete(id)
+    setPendingFiles((prev) => {
+      const target = prev.find((entry) => entry.id === id)
+      if (target?.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(target.previewUrl)
+      return prev.filter((entry) => entry.id !== id)
+    })
+  }
+
+  function clearPendingFiles() {
+    for (const controller of uploadAbortsRef.current.values()) controller.abort()
+    uploadAbortsRef.current.clear()
+    setPendingFiles((prev) => {
+      for (const entry of prev) {
+        if (entry.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(entry.previewUrl)
+      }
+      return []
+    })
+  }
+
+  /**
+   * Отправка всей панели. Файлы уходят по очереди, а подпись достаётся
+   * первому — как в Telegram, где подписан альбом, а не каждый снимок.
+   * Плитка исчезает из панели ровно тогда, когда её сообщение ушло, поэтому
+   * оборванная посередине отправка оставляет неотправленное на месте.
+   */
+  async function sendPendingFiles(caption: string) {
+    const queue = pendingFilesRef.current
+    if (!queue.length) return
+    setUploadError('')
+    setUploading(true)
+    let captionUsed = false
+    try {
+      for (const item of queue) {
+        const controller = new AbortController()
+        uploadAbortsRef.current.set(item.id, controller)
+        setPendingFiles((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, uploading: true, progress: 0 } : entry))
+        // eslint-disable-next-line no-await-in-loop -- очередь намеренно последовательная: порядок сообщений в чате должен совпадать с порядком плиток
+        const attachment = await prepareAttachment(item.file, {
+          messageType: item.messageType,
+          duration: item.duration,
+          width: item.width,
+          height: item.height,
+          signal: controller.signal,
+          onProgress: (fraction) => setPendingFiles((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, progress: fraction } : entry)),
+        })
+        uploadAbortsRef.current.delete(item.id)
+        // eslint-disable-next-line no-await-in-loop -- см. выше
+        const sent = await onSend(captionUsed ? '' : caption, attachment, replyingTo?.id)
+        if (!sent) throw new Error(OFFLINE_ERROR)
+        captionUsed = true
+        discardPendingFile(item.id)
+      }
+      setReplyingTo(null)
+    } catch (err) {
+      if (!(err instanceof UploadAbortedError)) setUploadError((err as Error).message)
+      // Подпись не ушла ни с одним файлом — возвращаем её в поле ввода.
+      if (!captionUsed && caption) setDraft(caption)
+    } finally {
+      setUploading(false)
+      setPendingFiles((prev) => prev.map((entry) => ({ ...entry, uploading: false, progress: 0 })))
+    }
+  }
+
+  function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
+    void queueFiles(Array.from(e.target.files ?? []))
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
   function handleComposerPaste(e: React.ClipboardEvent<HTMLElement>) {
-    const items = Array.from(e.clipboardData?.items ?? [])
-    const fileItem = items.find((item) => item.kind === 'file')
-    if (!fileItem) return
-    const file = fileItem.getAsFile()
-    if (!file || uploading) return
+    const files = Array.from(e.clipboardData?.items ?? [])
+      .filter((item) => item.kind === 'file')
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file))
+    if (!files.length) return
     e.preventDefault()
-    void uploadAndSend(file)
-  }
-
-  /** Перетащили один или несколько файлов в окно чата — отправляем по очереди. */
-  async function uploadDroppedFiles(files: FileList) {
-    for (const file of Array.from(files)) {
-      // eslint-disable-next-line no-await-in-loop -- нужна последовательная отправка, не параллельная
-      await uploadAndSend(file)
-    }
+    void queueFiles(files)
   }
 
   async function startRecording() {
@@ -595,10 +764,6 @@ export function ChatWindow({
     recordingTimerRef.current = null
     setIsRecording(false)
     if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
-  }
-
-  function formatDuration(seconds: number) {
-    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
   }
 
   async function handleSearchSubmit(e: React.FormEvent) {
@@ -782,7 +947,7 @@ export function ChatWindow({
         event.preventDefault()
         dragCounterRef.current = 0
         setIsDraggingFile(false)
-        void uploadDroppedFiles(event.dataTransfer.files)
+        void queueFiles(Array.from(event.dataTransfer.files))
       }}
     >
       <header className="chat-panel__header">
@@ -1078,7 +1243,7 @@ export function ChatWindow({
                   onToggleSelected={toggleMessageSelected}
                   onSelectionDragStart={startSelectionDrag}
                   onSelectionDragEnter={continueSelectionDrag}
-                  onOpenImage={(url, name) => setLightboxImage({ url, name })}
+                  onOpenMedia={setLightboxMedia}
                 />
               </div>
             )
@@ -1118,6 +1283,53 @@ export function ChatWindow({
 
       {uploadError && <div className="composer-error" role="alert">{uploadError}</div>}
 
+      {pendingFiles.length > 0 && (
+        <div className="attach-tray">
+          <div className="attach-tray__head">
+            <strong>{pendingFiles.length === 1 ? 'Вложение' : `Вложений: ${pendingFiles.length}`}</strong>
+            <span>Подпись возьмётся из поля ввода</span>
+            <button type="button" className="attach-tray__clear" onClick={clearPendingFiles}>
+              {uploading ? 'Отменить' : 'Убрать все'}
+            </button>
+          </div>
+          <div className="attach-tray__items">
+            {pendingFiles.map((item) => (
+              <div key={item.id} className={`attach-item${item.uploading ? ' is-uploading' : ''}`}>
+                {item.previewUrl ? (
+                  <img className="attach-item__preview" src={item.previewUrl} alt="" />
+                ) : (
+                  <span className="attach-item__preview attach-item__preview--file">
+                    <AttachIcon width={20} height={20} />
+                  </span>
+                )}
+                {item.messageType === 'video' && !item.uploading && (
+                  <span className="attach-item__badge">
+                    {item.duration ? formatMediaDuration(item.duration) : 'Видео'}
+                  </span>
+                )}
+                {item.uploading && (
+                  <span className="attach-item__progress" role="progressbar" aria-valuenow={Math.round(item.progress * 100)}>
+                    <span className="attach-item__progress-bar" style={{ transform: `scaleX(${item.progress})` }} />
+                    <em>{Math.round(item.progress * 100)}%</em>
+                  </span>
+                )}
+                <span className="attach-item__name" title={item.file.name}>{item.file.name}</span>
+                <span className="attach-item__size">{formatFileSize(item.file.size)}</span>
+                <button
+                  type="button"
+                  className="attach-item__remove"
+                  onClick={() => discardPendingFile(item.id)}
+                  title="Убрать вложение"
+                  aria-label={`Убрать ${item.file.name}`}
+                >
+                  <CloseIcon width={13} height={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {formatBar && !isRecording && (
         <div className="format-bar" role="toolbar" aria-label="Форматирование текста">
           {FORMAT_BUTTONS.map(({ kind, label, hint }) => (
@@ -1145,6 +1357,7 @@ export function ChatWindow({
           type="file"
           ref={fileInputRef}
           className="hidden-file-input"
+          multiple
           onChange={handleFilePick}
           accept="image/*,video/mp4,video/webm,video/quicktime,audio/*,.ogg,.oga,.opus,.pdf,.txt,.csv,.zip,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
         />
@@ -1176,7 +1389,7 @@ export function ChatWindow({
               <div className="voice-recording__status">
                 <span className="voice-recording__dot" />
                 <strong>Запись</strong>
-                <time>{formatDuration(recordingSeconds)}</time>
+                <time>{formatMediaDuration(recordingSeconds)}</time>
               </div>
               <div className="voice-recording__wave" aria-hidden="true">
                 {Array.from({ length: 28 }, (_, index) => (
@@ -1224,7 +1437,7 @@ export function ChatWindow({
           ref={composerRef}
           className="text-input message-composer"
           rows={1}
-          placeholder="Напишите сообщение..."
+          placeholder={pendingFiles.length ? 'Добавьте подпись…' : 'Напишите сообщение...'}
           value={draft}
           maxLength={4000}
           onChange={(e) => handleDraftChange(e.target.value)}
@@ -1248,7 +1461,7 @@ export function ChatWindow({
             e.currentTarget.form?.requestSubmit()
           }}
         />
-        {!draft.trim() && (
+        {!draft.trim() && !pendingFiles.length && (
           <button
             type="button"
             className="icon-btn voice-start"
@@ -1259,9 +1472,14 @@ export function ChatWindow({
             <MicIcon width={19} height={19} />
           </button>
         )}
-        {draft.trim() && (
-          <button type="submit" className="send-button" disabled={connectionStatus !== 'connected'} title={connectionStatus === 'connected' ? 'Отправить' : 'Нет соединения'}>
-            <SendIcon width={17} height={17} />
+        {(draft.trim() || pendingFiles.length > 0) && (
+          <button
+            type="submit"
+            className="send-button"
+            disabled={connectionStatus !== 'connected' || uploading}
+            title={connectionStatus === 'connected' ? 'Отправить' : 'Нет соединения'}
+          >
+            {uploading ? <SpinnerIcon width={17} height={17} /> : <SendIcon width={17} height={17} />}
           </button>
         )}
           </>
@@ -1303,8 +1521,13 @@ export function ChatWindow({
         />
       )}
 
-      {lightboxImage && (
-        <MediaLightbox url={lightboxImage.url} name={lightboxImage.name} onClose={() => setLightboxImage(null)} />
+      {lightboxMedia && (
+        <MediaLightbox
+          url={lightboxMedia.url}
+          name={lightboxMedia.name}
+          kind={lightboxMedia.kind}
+          onClose={() => setLightboxMedia(null)}
+        />
       )}
 
       {isDraggingFile && (

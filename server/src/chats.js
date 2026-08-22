@@ -24,7 +24,11 @@ function toPublicUserRow(row) {
     statusText: row.status_text ?? '',
     bio: row.bio ?? '',
     birthDate: row.birth_date,
-    lastSeenAt: row.last_seen_at ? Number(row.last_seen_at) : null,
+    // Выключенный тумблер «показывать время посещения» до сих пор соблюдал
+    // только интерфейс: сама метка всё равно уезжала каждому собеседнику, и
+    // любой клиент мог её прочитать. Настройка приватности, которую нужно
+    // соблюдать добровольно, приватности не даёт — режем на сервере.
+    lastSeenAt: row.show_last_seen === false || !row.last_seen_at ? null : Number(row.last_seen_at),
     createdAt: row.created_at ? Number(row.created_at) : null,
   }
 }
@@ -45,6 +49,7 @@ function toPublicMessage(row) {
     callMeta: row.call_meta ?? null,
     encrypted: Boolean(row.encrypted),
     encryptionData: row.encryption_data ?? null,
+    albumId: row.album_id ?? null,
     createdAt: Number(row.created_at),
   }
 }
@@ -315,7 +320,7 @@ export function isSafeAttachmentUrl(url) {
   return typeof url === 'string' && /^\/uploads\/[A-Za-z0-9._-]{1,120}$/.test(url) && !url.includes('..')
 }
 
-export async function addMessage(chatId, senderId, { type = 'text', text = '', attachmentUrl = null, attachment = null, replyToId = null, forwarded = false, callMeta = null, encrypted = false, encryptionData = null }) {
+export async function addMessage(chatId, senderId, { type = 'text', text = '', attachmentUrl = null, attachment = null, replyToId = null, forwarded = false, callMeta = null, encrypted = false, encryptionData = null, albumId = null }) {
   if (attachmentUrl !== null && !isSafeAttachmentUrl(attachmentUrl)) {
     throw appError('Недопустимое вложение')
   }
@@ -453,6 +458,21 @@ export async function markRead(chatId, userId, messageId) {
 export async function membersOf(chatId) {
   const rows = await many('SELECT user_id FROM chat_members WHERE chat_id = $1', [chatId])
   return rows.map((r) => r.user_id)
+}
+
+/**
+ * Все, с кем пользователь состоит хотя бы в одном общем чате. Только этим людям
+ * имеет смысл рассказывать, что он зашёл или вышел: остальным его присутствие
+ * ни на что не влияет, а знать о нём они не должны.
+ */
+export async function contactIdsForUser(userId) {
+  const rows = await many(
+    `SELECT DISTINCT other.user_id FROM chat_members mine
+       JOIN chat_members other ON other.chat_id = mine.chat_id AND other.user_id <> $1
+      WHERE mine.user_id = $1`,
+    [userId],
+  )
+  return rows.map((row) => row.user_id)
 }
 
 export async function chatIdsForUser(userId) {

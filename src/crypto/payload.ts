@@ -22,6 +22,9 @@ export interface AttachmentPayload extends FileSecret {
   size: number
   /** Длительность голосового или видео в секундах. */
   duration?: number
+  /** Размеры кадра: серверу их знать неоткуда, он видит только шифротекст. */
+  width?: number
+  height?: number
   /** Как показывать: image, video, audio, voice, file. */
   messageType: string
 }

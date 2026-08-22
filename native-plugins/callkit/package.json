@@ -12,7 +12,7 @@
   "files": [
     "ios/Sources",
     "Package.swift",
-    "CornetCallKit.podspec"
+    "CornetCallkit.podspec"
   ],
   "keywords": [
     "capacitor",

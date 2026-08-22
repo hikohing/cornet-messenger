@@ -32,6 +32,7 @@ export function useChats(
   currentUserId: number | null,
   preferences: AppPreferences,
   updatePreferences: (patch: Partial<AppPreferences>) => void,
+  onSessionEnded?: () => void,
 ) {
   const [chats, setChats] = useState<Chat[]>([])
   const [folders, setFolders] = useState<ChatFolder[]>([])
@@ -43,6 +44,11 @@ export function useChats(
   const socketRef = useRef<ReturnType<typeof connectSocket> | null>(null)
   const typingTimeouts = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const activeChatIdRef = useRef<number | null>(null)
+  const messagesByChatRef = useRef(messagesByChat)
+  const wasConnectedRef = useRef(false)
+  const onSessionEndedRef = useRef(onSessionEnded)
+  onSessionEndedRef.current = onSessionEnded
+  messagesByChatRef.current = messagesByChat
   const currentUserIdRef = useRef(currentUserId)
   const preferencesRef = useRef(preferences)
   const chatsRef = useRef(chats)
@@ -125,6 +131,62 @@ export function useChats(
     )
   }
 
+  /**
+   * Пока сокет был оборван — уснул ноутбук, моргнула сеть, приложение ушло в
+   * фон — сервер продолжал жить: приходили сообщения, правки, реакции. События
+   * о них ушли в никуда, а после переподключения клиент их не догонял и показывал
+   * переписку такой, какой она была до обрыва, до самой перезагрузки страницы.
+   * Поэтому на каждое восстановление связи перечитываем список чатов и историю
+   * тех из них, что уже открывали.
+   */
+  async function resyncAfterReconnect() {
+    try {
+      const [chatsRes, foldersRes] = await Promise.all([api.getChats(), api.getFolders().catch(() => null)])
+      setChats(sortChats(chatsRes.chats))
+      chatsRef.current = chatsRes.chats
+      if (foldersRes) setFolders(foldersRes.folders)
+      void decryptChatPreviews(chatsRes.chats)
+
+      const openChatIds = Object.keys(messagesByChatRef.current).map(Number)
+      const live = new Set(chatsRes.chats.map((c) => c.id))
+      for (const chatId of openChatIds) {
+        if (!live.has(chatId)) continue
+        const chat = chatsRes.chats.find((c) => c.id === chatId)
+        if (chat) await ensureChatKeysLoaded(chat, currentUserIdRef.current)
+        const res = await api.getMessages(chatId)
+        setMessagesByChat((prev) => {
+          // Своё неподтверждённое сообщение сервер ещё не вернул — иначе оно
+          // исчезло бы из ленты у отправителя прямо на глазах. Но ровно то же
+          // сообщение могло и дойти, а потеряться — эхо о нём: тогда оно уже
+          // лежит в перечитанной истории, и оставленная копия осталась бы
+          // вечным дублем. Такую копию узнаём по паре «отправитель + текст» из
+          // сообщений, которых до догона у нас не было, и каждое серверное
+          // сообщение закрывает не больше одной копии.
+          const known = new Set((prev[chatId] ?? []).map((m) => m.id))
+          const unclaimed = res.messages.filter((m) => !known.has(m.id))
+          const stillPending = (prev[chatId] ?? []).filter((pending) => {
+            if (!pending.pending) return false
+            const echo = unclaimed.find((m) =>
+              m.senderId === pending.senderId &&
+              (m.attachmentUrl ?? null) === (pending.attachmentUrl ?? null) &&
+              (m.encrypted ? true : m.text === pending.text),
+            )
+            if (!echo) return true
+            unclaimed.splice(unclaimed.indexOf(echo), 1)
+            return false
+          })
+          return { ...prev, [chatId]: [...res.messages, ...stillPending] }
+        })
+        for (const message of res.messages) {
+          if (message.encrypted) void decryptAndPatch(message)
+        }
+      }
+    } catch {
+      // Связь могла отвалиться прямо посреди догона — следующее подключение
+      // повторит попытку, терять тут нечего.
+    }
+  }
+
   useEffect(() => {
     const pendingTypingTimeouts = typingTimeouts.current
     if (!token) {
@@ -132,6 +194,7 @@ export function useChats(
       setMessagesByChat({})
       return
     }
+    wasConnectedRef.current = false
 
     api.getChats().then((res) => {
       setChats(sortChats(res.chats))
@@ -235,9 +298,12 @@ export function useChats(
           if (optimisticIndex === -1) return { ...prev, [message.chatId]: [...current, message] }
           const updated = current.map((item, index) =>
             // Carry the optimistic row's key and already-known plaintext across
-            // so the row is updated in place rather than remounted.
+            // so the row is updated in place rather than remounted. Ключ от
+            // вложения переносится вместе с текстом: без него собственное фото
+            // на секунду превращалось в «Зашифрованное вложение», пока эхо
+            // сервера не расшифруется заново.
             index === optimisticIndex
-              ? { ...message, clientKey: item.clientKey, decryptedText: item.decryptedText }
+              ? { ...message, clientKey: item.clientKey, decryptedText: item.decryptedText, decryptedFile: item.decryptedFile }
               : item,
           )
           return { ...prev, [message.chatId]: updated }
@@ -348,7 +414,14 @@ export function useChats(
       } else if (event.type === 'pinned') {
         api.getChats().then((res) => setChats(sortChats(res.chats)))
       }
-    }, setConnectionStatus)
+    }, (status) => {
+      setConnectionStatus(status)
+      if (status !== 'connected') return
+      // Первое подключение уже сопровождается загрузкой чатов ниже — догонять
+      // нечего. Догон нужен именно после разрыва.
+      if (wasConnectedRef.current) void resyncAfterReconnect()
+      wasConnectedRef.current = true
+    }, () => onSessionEndedRef.current?.())
     socketRef.current = socket
 
     return () => {
@@ -403,6 +476,8 @@ export function useChats(
         mimeType: attachment.mimeType,
         size: attachment.size,
         duration: attachment.duration,
+        width: attachment.width,
+        height: attachment.height,
         messageType: attachment.messageType,
       }
       : undefined
@@ -446,6 +521,8 @@ export function useChats(
         mimeType: attachment.mimeType,
         size: attachment.size,
         duration: attachment.duration,
+        width: attachment.width,
+        height: attachment.height,
       } : null,
       replyToId: replyToId ?? null,
       forwarded: false,

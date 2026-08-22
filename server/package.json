@@ -1,6 +1,6 @@
 {
   "name": "web-messenger-server",
-  "version": "0.0.1",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "main": "src/index.js",
@@ -9,13 +9,13 @@
     "reports": "node src/moderation.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "express-rate-limit": "^8.6.1",
-    "multer": "^2.0.1",
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "express-rate-limit": "^8.6.2",
+    "multer": "^2.2.0",
     "otpauth": "^9.5.1",
-    "pg": "^8.22.0",
+    "pg": "^8.23.0",
     "web-push": "^3.6.7",
-    "ws": "^8.18.0"
+    "ws": "^8.21.3"
   }
 }

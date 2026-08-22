@@ -20,6 +20,9 @@ export interface AttachmentView {
   name: string
   size?: number
   duration?: number
+  /** Размеры кадра, если отправитель их измерил: место под медиа занимаем заранее. */
+  width?: number
+  height?: number
   /** Готовая ссылка для тега: обычная или blob:. Пока не готова — null. */
   src: string | null
   status: 'ready' | 'decrypting' | 'idle' | 'error' | 'locked'
@@ -75,6 +78,8 @@ export function useAttachmentSource(message: Message): AttachmentView {
       name: message.attachment?.name || 'Файл',
       size: message.attachment?.size,
       duration: message.attachment?.duration,
+      width: message.attachment?.width,
+      height: message.attachment?.height,
       src: resolveUrl(message.attachmentUrl),
       status: 'ready',
     }
@@ -96,6 +101,8 @@ export function useAttachmentSource(message: Message): AttachmentView {
     name: file.name,
     size: file.size,
     duration: file.duration,
+    width: file.width,
+    height: file.height,
     src: objectUrl,
     status: objectUrl ? 'ready' : status,
     load: EAGER_TYPES.has(file.messageType) ? undefined : () => void load(),

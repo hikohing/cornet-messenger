@@ -249,6 +249,20 @@ export function CheckIcon(props: IconProps) {
   )
 }
 
+/**
+ * Часы на месте галочки, пока сервер не подтвердил отправку. Свой глиф, а не
+ * TimerIcon: тот уже занят исчезающими сообщениями, и одна и та же картинка в
+ * двух смыслах читалась бы как «это сообщение с таймером».
+ */
+export function ClockIcon(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5.5l3.5 2" />
+    </svg>
+  )
+}
+
 export function DoubleCheckIcon(props: IconProps) {
   return (
     <svg {...base(props)} viewBox="0 0 28 24" width={24} height={20}>
@@ -462,6 +476,15 @@ export function MinimizeIcon(props: IconProps) {
       <path d="M20 10h-6V4" />
       <path d="M14 10l7-7" />
       <path d="M3 21l7-7" />
+    </svg>
+  )
+}
+
+/** Заливка, а не контур: на кнопке поверх кадра контурный треугольник теряется. */
+export function PlayIcon(props: IconProps) {
+  return (
+    <svg {...base(props)} fill="currentColor" stroke="none">
+      <path d="M8 5.2v13.6a1 1 0 0 0 1.53.85l10.6-6.8a1 1 0 0 0 0-1.7L9.53 4.35A1 1 0 0 0 8 5.2z" />
     </svg>
   )
 }

@@ -10,7 +10,8 @@ import { fetchAndVerifyPublicKeys } from '../hooks/useCrypto'
  * — одноразовый ECDH на каждое сообщение, в группе — общий симметричный ключ
  * поколения (см. groupSession.ts).
  *
- * «Избранное» не шифруется: это заметки самому себе, второй стороны нет.
+ * «Избранное» шифруется тоже: второй стороны там нет, поэтому получателем
+ * выступает сам автор — иначе заметки лежали бы на сервере открытым текстом.
  */
 export function isEncryptable(chat: Chat | undefined, currentUserId: number | null): boolean {
   if (!chat || currentUserId === null) return false
@@ -33,6 +34,13 @@ export async function ensureChatKeysLoaded(chat: Chat, currentUserId: number | n
     const other = chat.members.find((m) => m.id !== currentUserId)
     if (!other || getPublicKey(other.id)) return
     await fetchAndVerifyPublicKeys([other.id])
+    return
+  }
+  // «Избранное» адресовано самому себе, значит нужен собственный публичный
+  // ключ. В кэш он попадает при инициализации ключей, но кэш переживает
+  // чистку хранилища хуже, чем аккаунт, — а без ключа заметки не отправить.
+  if (chat.type === 'saved') {
+    if (!getPublicKey(currentUserId)) await fetchAndVerifyPublicKeys([currentUserId])
     return
   }
   if (chat.type !== 'group') return

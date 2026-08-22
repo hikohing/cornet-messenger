@@ -1,6 +1,6 @@
 'use strict'
 
-const { app, BrowserWindow, shell, Menu, dialog } = require('electron')
+const { app, BrowserWindow, shell, Menu, dialog, session, desktopCapturer } = require('electron')
 const path = require('node:path')
 const { MirrorStore, pickWorkingMirror, checkMirrorHealth, refreshRemoteMirrors } = require('./mirrors.js')
 
@@ -70,6 +70,51 @@ function restrictNavigation(webContents, allowedOrigin) {
     if (url.startsWith('http://') || url.startsWith('https://')) void shell.openExternal(url)
     return { action: 'deny' }
   })
+}
+
+/**
+ * Без этого обработчика `getDisplayMedia` в Electron отказывает с
+ * «NotSupported», и кнопка демонстрации экрана в звонке не делает ровно ничего:
+ * клиент считает отказ выбором пользователя и молчит. Выбор источника в
+ * браузере показывает сам браузер, здесь его показать некому — поэтому один
+ * экран отдаём сразу, а из нескольких даём выбрать в нативном диалоге.
+ */
+function enableScreenSharing() {
+  session.defaultSession.setDisplayMediaRequestHandler(
+    async (_request, callback) => {
+      try {
+        const screens = await desktopCapturer.getSources({ types: ['screen'] })
+        if (screens.length === 0) {
+          callback()
+          return
+        }
+        if (screens.length === 1) {
+          callback({ video: screens[0] })
+          return
+        }
+        const { response } = await dialog.showMessageBox(mainWindow, {
+          type: 'question',
+          title: 'Демонстрация экрана',
+          message: 'Какой экран показать собеседнику?',
+          buttons: [...screens.map((s) => s.name), 'Отмена'],
+          cancelId: screens.length,
+          defaultId: 0,
+        })
+        const chosen = screens[response]
+        if (!chosen) {
+          callback()
+          return
+        }
+        callback({ video: chosen })
+      } catch (err) {
+        console.error('Не удалось получить список экранов:', err)
+        callback()
+      }
+    },
+    // Звук системы не захватываем: клиент просит только видео, а лишний поток
+    // отдал бы собеседнику всё, что играет на компьютере.
+    { useSystemPicker: false },
+  )
 }
 
 function startMirrorMonitoring() {
@@ -148,12 +193,30 @@ function createWindow() {
   })
 }
 
+// Второй запуск не должен поднимать второе окно: это второй WebSocket на тот же
+// аккаунт, дубли уведомлений и две копии одного разговора. Ярлык на панели задач
+// нажимают чаще, чем ищут уже открытое окно, — поэтому фокусируем имеющееся.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.focus()
+  })
+}
+
 app.whenReady().then(async () => {
+  // Windows опознаёт приложение в центре уведомлений по этому идентификатору.
+  // Без него всплывающие уведомления о сообщениях приходят от «Electron» — а в
+  // portable-сборке, у которой нет ярлыка в меню «Пуск», не приходят вовсе.
+  app.setAppUserModelId('com.connecto.desktop')
   store = new MirrorStore({
     defaultsPath: path.join(resourcesDir, 'mirrors.default.json'),
     userDataPath: path.join(app.getPath('userData'), 'mirrors.json'),
   })
   createWindow()
+  enableScreenSharing()
   await connectToBestMirror()
   startMirrorMonitoring()
   startAutoUpdate()

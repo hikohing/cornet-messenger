@@ -32,6 +32,21 @@ export function useAuth() {
     }
   }, [])
 
+  // Билет на медиа живёт полсуток, а нативное приложение с телефона неделями не
+  // выгружается: без обновления в какой-то момент все картинки и аватары просто
+  // перестали бы грузиться до перезапуска. Возврат из фона — самый частый и
+  // самый дешёвый момент, чтобы это проверить (сам вызов ничего не делает, пока
+  // до конца срока больше часа).
+  useEffect(() => {
+    if (!user) return
+    const refresh = () => void api.ensureMediaTicket()
+    const onAppState = (event: Event) => {
+      if ((event as CustomEvent<{ isActive: boolean }>).detail?.isActive) refresh()
+    }
+    document.addEventListener('native:appstate', onAppState)
+    return () => document.removeEventListener('native:appstate', onAppState)
+  }, [user])
+
   async function login(username: string, password: string) {
     setError(null)
     try {

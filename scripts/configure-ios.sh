@@ -16,6 +16,19 @@ if [ ! -f "$PLIST" ]; then
   exit 1
 fi
 
+echo "→ Минимальная версия iOS"
+# Шаблон Capacitor ставит 15.0, но на такой системе приложение бесполезно: вся
+# переписка шифруется X25519 и Ed25519 через WebCrypto, а их WebKit узнал только
+# в Safari 17.4. На iOS постарше ключи не создаются вовсе — не отправляется и не
+# читается ни одно сообщение. Пусть система лучше не даст поставить приложение,
+# чем поставит заведомо нерабочее.
+MIN_IOS="17.4"
+find ios -name project.pbxproj -print0 | xargs -0 sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = $MIN_IOS;/g"
+if [ -f ios/App/Podfile ]; then
+  sed -i '' -E "s/^platform :ios, '[0-9.]+'/platform :ios, '$MIN_IOS'/" ios/App/Podfile
+fi
+echo "  $MIN_IOS"
+
 echo "→ Разрешения в Info.plist"
 # Без этих строк приложение падает при первом же обращении к камере или микрофону.
 add_string() {

@@ -6,11 +6,13 @@ import { CloseIcon, DownloadIcon } from './icons'
 interface MediaLightboxProps {
   url: string
   name: string
+  /** Фото открывается картинкой, видео — плеером на весь экран. */
+  kind?: 'image' | 'video'
   onClose: () => void
 }
 
-/** Полноэкранный просмотр фото из переписки: открытие в новой вкладке заменено на нормальный вьюер. */
-export function MediaLightbox({ url, name, onClose }: MediaLightboxProps) {
+/** Полноэкранный просмотр медиа из переписки: открытие в новой вкладке заменено на нормальный вьюер. */
+export function MediaLightbox({ url, name, kind = 'image', onClose }: MediaLightboxProps) {
   useEscapeToClose(onClose)
   const resolved = resolveUrl(url)
 
@@ -19,7 +21,7 @@ export function MediaLightbox({ url, name, onClose }: MediaLightboxProps) {
       <div className="avatar-lightbox__toolbar">
         <div>
           <strong>{name}</strong>
-          <span>Фото</span>
+          <span>{kind === 'video' ? 'Видео' : 'Фото'}</span>
         </div>
         <div className="avatar-lightbox__actions">
           <a
@@ -37,7 +39,18 @@ export function MediaLightbox({ url, name, onClose }: MediaLightboxProps) {
           </button>
         </div>
       </div>
-      <img className="avatar-lightbox__image" src={resolved} alt={name} onClick={(event) => event.stopPropagation()} />
+      {kind === 'video' ? (
+        <video
+          className="avatar-lightbox__image"
+          src={resolved}
+          controls
+          autoPlay
+          playsInline
+          onClick={(event) => event.stopPropagation()}
+        />
+      ) : (
+        <img className="avatar-lightbox__image" src={resolved} alt={name} onClick={(event) => event.stopPropagation()} />
+      )}
     </div>,
     document.body,
   )

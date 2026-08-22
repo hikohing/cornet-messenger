@@ -54,18 +54,34 @@ export interface StoredPublicKey {
   createdAt: number
 }
 
-export async function generateKeyPair(): Promise<UserKeyPair> {
-  const x25519Pair = await crypto.subtle.generateKey(
-    { name: 'X25519' },
-    true,
-    ['deriveBits']
-  )
+/**
+ * WebCrypto узнал X25519 и Ed25519 не сразу: Chromium — только к 137-й версии,
+ * Safari — к 17.4. На движке постарше `generateKey` отвечает NotSupportedError,
+ * ключей у аккаунта не появляется, и дальше всё выглядит как «шифрование не
+ * удалось» на каждое действие. Отличаем этот случай, чтобы сказать человеку
+ * прямо: дело не в его переписке, а в устаревшей оболочке.
+ */
+export const CRYPTO_UNSUPPORTED = 'CRYPTO_UNSUPPORTED'
 
-  const ed25519Pair = await crypto.subtle.generateKey(
-    { name: 'Ed25519' },
-    true,
-    ['sign', 'verify']
-  )
+export async function generateKeyPair(): Promise<UserKeyPair> {
+  let x25519Pair: CryptoKeyPair
+  let ed25519Pair: CryptoKeyPair
+  try {
+    x25519Pair = await crypto.subtle.generateKey(
+      { name: 'X25519' },
+      true,
+      ['deriveBits']
+    )
+
+    ed25519Pair = await crypto.subtle.generateKey(
+      { name: 'Ed25519' },
+      true,
+      ['sign', 'verify']
+    )
+  } catch (err) {
+    if (err instanceof Error && err.name === 'NotSupportedError') throw new Error(CRYPTO_UNSUPPORTED)
+    throw err
+  }
 
   return {
     x25519: {

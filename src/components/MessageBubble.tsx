@@ -18,11 +18,14 @@ import {
   ForwardIcon,
   LockIcon,
   PinIcon,
+  ClockIcon,
   ReplyIcon,
   SpinnerIcon,
   TrashIcon,
 } from './icons'
 import { useAttachmentSource } from '../hooks/useAttachmentSource'
+import { formatFileSize } from '../utils/media'
+import { MessageMedia, type MediaViewerTarget } from './MessageMedia'
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
 
@@ -55,17 +58,11 @@ interface MessageBubbleProps {
   onToggleSelected: (message: Message) => void
   onSelectionDragStart: (message: Message, selected: boolean) => void
   onSelectionDragEnter: (message: Message) => void
-  onOpenImage: (url: string, name: string) => void
+  onOpenMedia: (target: MediaViewerTarget) => void
 }
 
 function formatTime(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-}
-
-function formatFileSize(bytes = 0) {
-  if (bytes < 1024) return `${bytes} Б`
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`
 }
 
 function attachmentLabel(message: Message) {
@@ -129,7 +126,7 @@ export const MessageBubble = memo(function MessageBubble({
   onToggleSelected,
   onSelectionDragStart,
   onSelectionDragEnter,
-  onOpenImage,
+  onOpenMedia,
 }: MessageBubbleProps) {
   const resolved = resolveMessageText(message)
   const emojiOnly = Boolean(resolved.text && /^(?:\p{Extended_Pictographic}|️|‍|\s){1,16}$/u.test(resolved.text))
@@ -142,6 +139,32 @@ export const MessageBubble = memo(function MessageBubble({
   const skipNextSelectionClickRef = useRef(false)
   const { menu, openFromMouseEvent, openFromTouchEvent, close: closeMenu } = useContextMenu()
   const media = useAttachmentSource(message)
+  // Кадр во всю ширину пузыря: у него нет полей, а подпись и время ложатся
+  // поверх или под ним — отсюда отдельные классы пузыря.
+  // Видео показывается кадром даже до загрузки байтов: в зашифрованном чате их
+  // тянут по нажатию, но выглядеть это должно как видео, а не как строка файла.
+  const framedMedia = media.type === 'image'
+    ? Boolean(media.src)
+    : media.type === 'video' && Boolean(media.src || media.load)
+  const caption = !editing && Boolean(resolved.text || resolved.pending || resolved.failed)
+  // Время лежит поверх кадра только у медиа без подписи: с подписью оно
+  // становится частью её последней строки, а в режиме правки — отдельной.
+  const showTimeOnMedia = framedMedia && !caption && !editing
+
+  const timestamp = (
+    <>
+      {message.editedAt && <span className="edited-label">изменено</span>}
+      {formatTime(message.createdAt)}
+      {isOwn && (
+        // Как в Telegram: часы → галочка (сервер принял) → две галочки
+        // (прочитано). Без единой надписи и без прыжка подписи — время на
+        // месте с самого начала.
+        <span className="read-check">
+          {message.pending ? <ClockIcon width={13} height={13} /> : isRead ? <DoubleCheckIcon /> : <CheckIcon width={14} height={14} />}
+        </span>
+      )}
+    </>
+  )
 
   function buildMenuItems(): ContextMenuItem[] {
     const items: ContextMenuItem[] = [
@@ -253,7 +276,7 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
         <div
-          className="message-bubble"
+          className={`message-bubble${framedMedia ? ' has-media' : ''}${framedMedia && caption ? ' has-caption' : ''}`}
           onContextMenu={(e) => {
             if (editing || message.pending) return
             openFromMouseEvent(e, buildMenuItems())
@@ -282,18 +305,12 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           )}
 
-          {media.type === 'image' && media.src && (
-            <button
-              type="button"
-              className="message-media-link"
-              onClick={() => onOpenImage(media.src!, media.name)}
-            >
-              <img className="message-image" src={media.src} alt={media.name} loading="lazy" />
-            </button>
-          )}
-
-          {media.type === 'video' && media.src && (
-            <video className="message-video" src={media.src} controls preload="metadata" />
+          {framedMedia && (
+            <MessageMedia
+              media={media}
+              onOpen={onOpenMedia}
+              overlay={showTimeOnMedia ? <span className="message-time message-time--on-media">{timestamp}</span> : undefined}
+            />
           )}
 
           {(media.type === 'voice' || media.type === 'audio') && media.src && (
@@ -317,7 +334,7 @@ export const MessageBubble = memo(function MessageBubble({
 
           {/* Видео и документы не тянем сами: 25 МБ на каждое открытие чата —
               слишком дорого для мобильного трафика. */}
-          {media.load && !media.src && media.status !== 'error' && (
+          {media.load && !media.src && media.status !== 'error' && media.type !== 'video' && (
             <button type="button" className="message-file message-file--pending" onClick={media.load} disabled={media.status === 'decrypting'}>
               <span className="message-file__icon">
                 {media.status === 'decrypting' ? <SpinnerIcon width={18} height={18} /> : <LockIcon width={18} height={18} />}
@@ -368,13 +385,7 @@ export const MessageBubble = memo(function MessageBubble({
               <div className={`message-text${emojiOnly ? ' emoji-only' : ''}`}>
                 {message.encrypted && <LockIcon width={12} height={12} className="message-encrypted-icon" />}
                 {renderFormattedText(resolved.text)}
-                <span className="message-time message-time--float">
-                  {message.editedAt && <span className="edited-label">изменено</span>}
-                  {message.pending ? 'Отправка…' : formatTime(message.createdAt)}
-                  {isOwn && !message.pending && (
-                    <span className="read-check">{isRead ? <DoubleCheckIcon /> : <CheckIcon width={14} height={14} />}</span>
-                  )}
-                </span>
+                <span className="message-time message-time--float">{timestamp}</span>
               </div>
             )
           )}
@@ -393,15 +404,7 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           )}
 
-          {((!resolved.text && !resolved.pending && !resolved.failed) || editing) && (
-            <div className="message-time">
-              {message.editedAt && <span className="edited-label">изменено</span>}
-              {message.pending ? 'Отправка…' : formatTime(message.createdAt)}
-              {isOwn && !message.pending && (
-                <span className="read-check">{isRead ? <DoubleCheckIcon /> : <CheckIcon width={14} height={14} />}</span>
-              )}
-            </div>
-          )}
+          {!caption && !showTimeOnMedia && <div className="message-time">{timestamp}</div>}
         </div>
       </div>
       {selectionMode && !message.pending && (

@@ -8,6 +8,7 @@ import {
   clearKeysFor,
   setActiveKeyOwner,
   savePublicKey,
+  CRYPTO_UNSUPPORTED,
   type StoredPublicKey,
   type UserKeyPair,
 } from '../crypto/keys'
@@ -26,6 +27,10 @@ export function useCrypto(userId: number | null) {
   const [keyPair, setKeyPair] = useState<UserKeyPair | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Оболочка без нужных алгоритмов — это не сбой, который пройдёт сам: пока её
+  // не обновят, не отправится ни одно сообщение. Такое состояние показываем
+  // отдельно от обычных ошибок сети.
+  const [unsupported, setUnsupported] = useState(false)
   const uploadedFor = useRef<number | null>(null)
 
   useEffect(() => {
@@ -93,10 +98,24 @@ export function useCrypto(userId: number | null) {
             // уже ключ нового владельца — выгружать такое незачем.
             if (cancelled) return
           }
-          if (!matchesPublished(pair, published)) {
+          if (matchesPublished(pair, published)) {
+            // Свой публичный ключ нужен не только собеседникам: копия «самому
+            // себе» и «Избранное» шифруются им же. Без этой строки он оседал
+            // только на сервере, а локальный кэш оставался без него — и
+            // «Избранное» отвечало «не удалось зашифровать» на каждое
+            // сообщение.
+            if (published) savePublicKey(published)
+          } else {
             const signature = await signPublicKeyBundle(pair.x25519.publicKey, pair.ed25519.publicKey)
             if (signature) {
               await uploadPublicKeys(pair.x25519.publicKey, pair.ed25519.publicKey, signature)
+              savePublicKey({
+                userId: owner,
+                x25519PublicKey: pair.x25519.publicKey,
+                ed25519PublicKey: pair.ed25519.publicKey,
+                publicKeySignature: signature,
+                createdAt: Date.now(),
+              })
             }
           }
         }
@@ -104,6 +123,7 @@ export function useCrypto(userId: number | null) {
         if (cancelled) return
         // Выгрузку имеет смысл повторить: до неё могло и не дойти.
         uploadedFor.current = null
+        if (err instanceof Error && err.message === CRYPTO_UNSUPPORTED) setUnsupported(true)
         setError(err instanceof Error ? err.message : 'Failed to initialize encryption keys')
       } finally {
         if (!cancelled) setIsLoading(false)
@@ -120,6 +140,7 @@ export function useCrypto(userId: number | null) {
     keyPair,
     isLoading,
     error,
+    unsupported,
     reset: () => {
       if (userId !== null) clearKeysFor(userId)
       setKeyPair(null)

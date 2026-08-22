@@ -15,10 +15,12 @@ import {
   getChatForViewer,
   getMessageById,
   otherDirectMemberId,
+  contactIdsForUser,
 } from './chats.js'
 import { assertPollAllowed, createPoll, votePoll, closePoll } from './polls.js'
 import { isBlockedEitherWay } from './blocking.js'
 import { NATIVE_ORIGINS } from './origins.js'
+import { publicErrorMessage } from './errors.js'
 import { configurePushRuntime, notifyIncomingCall, notifyNewMessage, voipDeviceCount } from './push.js'
 import {
   answerCall,
@@ -38,6 +40,15 @@ import {
 const MAX_TEXT_LENGTH = 4000
 const HEARTBEAT_INTERVAL_MS = 30000
 const MESSAGE_TYPES = new Set(['image', 'video', 'audio', 'voice', 'file'])
+
+/** Ширина/высота кадра: целое в пределах здравого смысла, иначе — не сохраняем. */
+function clampDimension(value) {
+  const number = Math.round(Number(value))
+  if (!Number.isFinite(number) || number <= 0) return undefined
+  return Math.min(number, 20000)
+}
+/** События, каждое из которых заводит новое сообщение в чате — им положен строгий лимит. */
+const MESSAGE_CREATING_TYPES = new Set(['send', 'forward', 'poll_create'])
 const SESSION_COOKIE = 'connecto_session'
 /** Кадр крупнее этого браузер никогда не отправит осмысленно (SDP с кучей кандидатов — пара КБ). */
 const WS_MAX_PAYLOAD_BYTES = 128 * 1024
@@ -244,9 +255,15 @@ export async function notifyMessagesExpired(swept) {
   }
 }
 
-function broadcastPresence(userId, online) {
-  const allConnectedUsers = [...connections.keys()]
-  broadcastToUsers(allConnectedUsers, { type: 'presence', userId, online })
+/**
+ * Присутствие видят только собеседники. Раньше событие уходило вообще всем, кто
+ * в этот момент онлайн: посторонние узнавали распорядок дня незнакомых людей, а
+ * заблокировавший — что его собеседник зашёл. Заодно это снимает рассылку
+ * «каждому о каждом», которая росла квадратично от числа подключений.
+ */
+async function broadcastPresence(userId, online) {
+  const contacts = await contactIdsForUser(userId)
+  broadcastToUsers(contacts, { type: 'presence', userId, online })
 }
 
 configureCallRuntime({
@@ -332,7 +349,7 @@ export function attachWebSocket(httpServer) {
     }
     const wasOffline = userSockets.size === 0
     userSockets.add(ws)
-    if (wasOffline) broadcastPresence(user.id, true)
+    if (wasOffline) await broadcastPresence(user.id, true)
     audit('socket.connected', { userId: user.id, username: user.username })
 
     ws.on('message', async (raw) => {
@@ -352,8 +369,10 @@ export function attachWebSocket(httpServer) {
         return
       }
       // Спам-сообщения в чат режем молча: собеседники не должны видеть ни самих
-      // сообщений, ни служебных ошибок из-за чужого флуда.
-      if (data.type === 'send' && !sendLimiter.take()) return
+      // сообщений, ни служебных ошибок из-за чужого флуда. Пересылка и опрос
+      // тоже создают сообщение и тоже будят пуши у всех участников, поэтому
+      // платят из того же ведра — иначе строгий лимит обходился бы в один клик.
+      if (MESSAGE_CREATING_TYPES.has(data.type) && !sendLimiter.take()) return
 
       try {
         if (data.type === 'send') {
@@ -375,6 +394,10 @@ export function attachWebSocket(httpServer) {
             mimeType: String(rawAttachment.mimeType || 'application/octet-stream').slice(0, 120),
             size: Math.max(0, Math.min(Number(rawAttachment.size) || 0, 25 * 1024 * 1024)),
             duration: Math.max(0, Math.min(Number(rawAttachment.duration) || 0, 60 * 60)),
+            // Размеры кадра приходят от клиента и нужны только для вёрстки —
+            // зажимаем в разумный диапазон, чтобы кривое значение не ломало ленту.
+            width: clampDimension(rawAttachment.width),
+            height: clampDimension(rawAttachment.height),
           } : null
           const replyToId = data.replyToId ? Number(data.replyToId) : null
           if (!chatId || (!text && !attachmentUrl && !encrypted)) return
@@ -634,7 +657,11 @@ export function attachWebSocket(httpServer) {
           return
         }
       } catch (err) {
-        send(ws, { type: 'error', message: err.message })
+        // Наружу уходит только то, что задумано как сообщение пользователю.
+        // Ошибка драйвера базы или упавшая строка кода — это внутренности
+        // сервера, и клиенту их видеть незачем; publicErrorMessage их залогирует
+        // и подменит общей формулировкой, как это уже делают HTTP-маршруты.
+        send(ws, { type: 'error', message: publicErrorMessage(err) })
       }
     })
 
@@ -646,7 +673,7 @@ export function attachWebSocket(httpServer) {
       if (sockets.size === 0) {
         connections.delete(user.id)
         await touchLastSeen(user.id)
-        broadcastPresence(user.id, false)
+        await broadcastPresence(user.id, false)
         audit('socket.disconnected', { userId: user.id, username: user.username })
       }
     })

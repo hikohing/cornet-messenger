@@ -38,7 +38,21 @@ export type SocketApi = ReturnType<typeof connectSocket>
 type Listener = (event: SocketEvent) => void
 type StatusListener = (status: ConnectionStatus) => void
 
-export function connectSocket(_session: string, onEvent: Listener, onStatus: StatusListener) {
+/**
+ * Коды закрытия, после которых переподключаться бессмысленно: сервер сказал не
+ * «попробуй позже», а «этой сессии больше нет» (4001 — разлогин, отзыв сессии,
+ * смена пароля, удаление аккаунта) либо «сюда нельзя» (4003 — чужой origin).
+ * Раньше клиент в обоих случаях уходил в вечный цикл переподключений, и человек
+ * видел бесконечное «переподключение…» вместо экрана входа.
+ */
+const TERMINAL_CLOSE_CODES = new Set([4001, 4003])
+
+export function connectSocket(
+  _session: string,
+  onEvent: Listener,
+  onStatus: StatusListener,
+  onSessionEnded?: () => void,
+) {
   const base = apiUrl() || window.location.origin
   const wsUrl = base.replace(/^http/, 'ws') + '/ws'
   let socket: WebSocket | null = null
@@ -67,14 +81,23 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
       }
     })
 
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', (e) => {
       socket = null
       if (manuallyClosed) {
         onStatus('disconnected')
         return
       }
+      if (TERMINAL_CLOSE_CODES.has(e.code)) {
+        manuallyClosed = true
+        onStatus('disconnected')
+        onSessionEnded?.()
+        return
+      }
       onStatus('reconnecting')
-      const delay = Math.min(1000 * 2 ** reconnectAttempt, 10_000)
+      // Джиттер: без него все клиенты, отвалившиеся от одного рестарта сервера,
+      // возвращаются ровно одновременно и кладут его повторно.
+      const backoff = Math.min(1000 * 2 ** reconnectAttempt, 10_000)
+      const delay = backoff * (0.7 + Math.random() * 0.6)
       reconnectAttempt += 1
       reconnectTimer = setTimeout(connect, delay)
     })
@@ -126,6 +149,8 @@ export function connectSocket(_session: string, onEvent: Listener, onStatus: Sta
           mimeType: attachment.mimeType,
           size: attachment.size,
           duration: attachment.duration,
+          width: attachment.width,
+          height: attachment.height,
         } : undefined,
         messageType: attachment?.messageType,
         replyToId,

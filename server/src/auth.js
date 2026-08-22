@@ -254,14 +254,17 @@ async function createSession(userId, userAgent) {
     safeUserAgent,
     now,
   ])
-  await run(
+  // Вытесненные по лимиту сессии возвращаем наверх: их строки из базы ушли, но
+  // живой сокет и зарегистрированное для пушей устройство остались бы работать —
+  // сокет до ближайшего heartbeat, а устройство до первой неудачной доставки.
+  const evicted = await many(
     `DELETE FROM sessions WHERE token IN (
        SELECT token FROM sessions WHERE user_id = $1 ORDER BY created_at DESC OFFSET $2
-     )`,
+     ) RETURNING token`,
     [userId, MAX_SESSIONS_PER_USER],
   )
   const user = await one('SELECT * FROM users WHERE id = $1', [userId])
-  return { token, user: toPublicUser(user) }
+  return { token, user: toPublicUser(user), evictedSessionHashes: evicted.map((row) => row.token) }
 }
 
 export async function userFromToken(token) {
@@ -329,12 +332,18 @@ export async function authMiddleware(req, res, next) {
 
 export async function updateProfile(userId, { color, avatarUrl, bannerUrl, bannerStyle, avatarDecoration, profileEffect, profileTheme, nameStyle, profileFrame, nameplateStyle, profilePrimaryColor, profileSecondaryColor, showLastSeen, bio, statusText, birthDate, displayName, username }) {
   const current = await one('SELECT * FROM users WHERE id = $1', [userId])
-  if (bio !== undefined && bio.length > 200) throw appError('Описание не должно превышать 200 символов')
-  if (statusText !== undefined && statusText.length > 60) throw appError('Статус не должен превышать 60 символов')
+  // null здесь — законный способ «очистить поле», и клиент им пользуется. До
+  // этого он натыкался на TypeError внутри .trim()/.length, который наружу
+  // выглядел как безликое «не удалось выполнить действие».
+  const nullableText = (value) => (value === null ? '' : value)
+  if (bio !== undefined) bio = nullableText(bio)
+  if (statusText !== undefined) statusText = nullableText(statusText)
+  if (bio !== undefined && (typeof bio !== 'string' || bio.length > 200)) throw appError('Описание не должно превышать 200 символов')
+  if (statusText !== undefined && (typeof statusText !== 'string' || statusText.length > 60)) throw appError('Статус не должен превышать 60 символов')
   if (birthDate !== undefined && birthDate !== null && !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) {
     throw appError('Некорректная дата рождения')
   }
-  if (displayName !== undefined && displayName !== null && displayName.length > 32) {
+  if (displayName !== undefined && displayName !== null && (typeof displayName !== 'string' || displayName.length > 32)) {
     throw appError('Отображаемое имя не должно превышать 32 символа')
   }
   if (avatarUrl !== undefined && avatarUrl !== null && !isSafeAttachmentUrl(avatarUrl)) {
@@ -382,7 +391,7 @@ export async function updateProfile(userId, { color, avatarUrl, bannerUrl, banne
       showLastSeen !== undefined ? Boolean(showLastSeen) : current.show_last_seen,
       bio !== undefined ? bio : current.bio,
       birthDate !== undefined ? birthDate : current.birth_date,
-      displayName !== undefined ? (displayName.trim() || null) : current.display_name,
+      displayName !== undefined ? (displayName === null ? null : displayName.trim() || null) : current.display_name,
       nextUsername,
       bannerUrl !== undefined ? bannerUrl : current.banner_url,
       bannerStyle !== undefined ? bannerStyle : current.banner_style,

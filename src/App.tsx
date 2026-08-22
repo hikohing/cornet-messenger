@@ -96,7 +96,7 @@ function App() {
     updateChatInfo,
     leaveChat,
     callSession,
-  } = useChats(token, user?.id ?? null, preferences, updatePreferences)
+  } = useChats(token, user?.id ?? null, preferences, updatePreferences, logout)
   const { call } = callSession
   const [selectedChatId, setSelectedChatId] = useState<number | null>(null)
   const [showSettings, setShowSettings] = useState(false)
@@ -282,6 +282,13 @@ function App() {
     <div
       className={`app-shell${selectedChatId !== null ? ' chat-open' : ''}${showInfoPanel ? ' info-open' : ''}`}
     >
+      {crypto.unsupported && (
+        <div className="crypto-banner" role="alert">
+          Это приложение не умеет шифровать переписку: в его движке нет X25519 и Ed25519.
+          Отправить или прочитать сообщения не получится — обновите приложение
+          (или откройте CorNet в свежей версии браузера).
+        </div>
+      )}
       <LeftRail
         activeView={railView}
         createOpen={showNewChat}
